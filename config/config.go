@@ -42,6 +42,15 @@ type Config struct {
 	MaxFramePayloadSize int          `json:"maxFramePayloadSize" yaml:"maxFramePayloadSize"`
 	TimestampJitterMax int           `json:"timestampJitterMax" yaml:"timestampJitterMax"` // 时间戳最大抖动(ms)
 
+	// 内存保护/背压
+	MaxPendingProxyBytes     int `json:"maxPendingProxyBytes" yaml:"maxPendingProxyBytes"`
+	MaxPendingProxyFragments int `json:"maxPendingProxyFragments" yaml:"maxPendingProxyFragments"`
+	MaxReassemblyPackets     int `json:"maxReassemblyPackets" yaml:"maxReassemblyPackets"`
+	MaxReassemblyBytes       int `json:"maxReassemblyBytes" yaml:"maxReassemblyBytes"`
+	MaxRecvReorderPackets    int `json:"maxRecvReorderPackets" yaml:"maxRecvReorderPackets"`
+	MaxRecvReorderBytes      int `json:"maxRecvReorderBytes" yaml:"maxRecvReorderBytes"`
+	MaxRTMPMessageSize       int `json:"maxRTMPMessageSize" yaml:"maxRTMPMessageSize"`
+
 	// TCP调优
 	TCP struct {
 		NoDelay         bool          `json:"noDelay" yaml:"noDelay"`
@@ -77,6 +86,13 @@ func DefaultConfig() *Config {
 		MaxSEIPerFrame:     4,
 		MaxFramePayloadSize: 4096,
 		TimestampJitterMax: 5,    // ±5ms抖动
+		MaxPendingProxyBytes:     8 * 1024 * 1024,
+		MaxPendingProxyFragments: 8192,
+		MaxReassemblyPackets:     1024,
+		MaxReassemblyBytes:       8 * 1024 * 1024,
+		MaxRecvReorderPackets:    4096,
+		MaxRecvReorderBytes:      8 * 1024 * 1024,
+		MaxRTMPMessageSize:       4 * 1024 * 1024,
 	}
 	c.Encryption.Enable = true
 	c.Encryption.Algorithm = "aes-256-gcm"
@@ -123,6 +139,27 @@ func (c *Config) Validate() error {
 	}
 	if c.FlushInterval <= 0 {
 		c.FlushInterval = 5 * time.Millisecond
+	}
+	if c.MaxPendingProxyBytes < 0 {
+		c.MaxPendingProxyBytes = 0
+	}
+	if c.MaxPendingProxyFragments < 0 {
+		c.MaxPendingProxyFragments = 0
+	}
+	if c.MaxReassemblyPackets < 0 {
+		c.MaxReassemblyPackets = 0
+	}
+	if c.MaxReassemblyBytes < 0 {
+		c.MaxReassemblyBytes = 0
+	}
+	if c.MaxRecvReorderPackets < 0 {
+		c.MaxRecvReorderPackets = 0
+	}
+	if c.MaxRecvReorderBytes < 0 {
+		c.MaxRecvReorderBytes = 0
+	}
+	if c.MaxRTMPMessageSize < 0 {
+		c.MaxRTMPMessageSize = 0
 	}
 	return nil
 }

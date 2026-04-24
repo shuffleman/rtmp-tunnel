@@ -63,6 +63,7 @@ type RTMPConn struct {
 	recvMu      sync.Mutex
 	recvNextSeq uint32
 	recvPackets map[uint32][]byte
+	recvPendingBytes int
 
 	// 控制
 	ctx       context.Context
@@ -73,6 +74,8 @@ type RTMPConn struct {
 	// 待嵌入视频帧的代理数据队列
 	pendingProxyData [][]byte
 	pendingMu        sync.Mutex
+	pendingCond      *sync.Cond
+	pendingBytes     int
 
 	// 统计
 	bytesSent  atomic.Uint64
@@ -119,7 +122,7 @@ func newConn(cfg *config.Config, isServer bool) *RTMPConn {
 		}
 	}
 
-	return &RTMPConn{
+	c := &RTMPConn{
 		cfg:          cfg,
 		isServer:     isServer,
 		ctx:          ctx,
@@ -138,6 +141,9 @@ func newConn(cfg *config.Config, isServer bool) *RTMPConn {
 		recvNextSeq:  1,
 		recvPackets:  make(map[uint32][]byte),
 	}
+	c.pendingCond = sync.NewCond(&c.pendingMu)
+	c.reassem.SetLimits(cfg.MaxReassemblyPackets, cfg.MaxReassemblyBytes)
+	return c
 }
 
 // Dial 客户端拨号
@@ -161,6 +167,7 @@ func (c *RTMPConn) Dial(addr string) error {
 	}
 
 	c.chunkCodec = protocol.NewChunkCodec()
+	c.chunkCodec.SetMaxMessageSize(c.cfg.MaxRTMPMessageSize)
 	c.ctrlMsgs = protocol.NewControlMessages(c.chunkCodec)
 
 	// 发送connect命令
@@ -197,6 +204,7 @@ func (c *RTMPConn) Accept(listener net.Listener) error {
 	}
 
 	c.chunkCodec = protocol.NewChunkCodec()
+	c.chunkCodec.SetMaxMessageSize(c.cfg.MaxRTMPMessageSize)
 	c.ctrlMsgs = protocol.NewControlMessages(c.chunkCodec)
 
 	// 启动服务端处理循环
@@ -226,6 +234,7 @@ func (c *RTMPConn) Wrap(tcpConn net.Conn, isServer bool) error {
 	}
 
 	c.chunkCodec = protocol.NewChunkCodec()
+	c.chunkCodec.SetMaxMessageSize(c.cfg.MaxRTMPMessageSize)
 	c.ctrlMsgs = protocol.NewControlMessages(c.chunkCodec)
 
 	if err := c.ctrlMsgs.SendInitialControlMessages(c.tcpConn, c.cfg.MaxChunkSize); err != nil {
@@ -352,6 +361,11 @@ func (c *RTMPConn) Close() error {
 		c.state = StateClosing
 		c.closeErr = fmt.Errorf("connection closed")
 		c.cancel()
+		c.pendingMu.Lock()
+		if c.pendingCond != nil {
+			c.pendingCond.Broadcast()
+		}
+		c.pendingMu.Unlock()
 		if c.tcpConn != nil {
 			c.tcpConn.Close()
 		}
@@ -417,8 +431,22 @@ func (c *RTMPConn) State() ConnState {
 func (c *RTMPConn) enqueueReceived(seq uint32, data []byte) {
 	c.recvMu.Lock()
 	if seq >= c.recvNextSeq {
+		if c.cfg.MaxRecvReorderPackets > 0 {
+			maxSeq := c.recvNextSeq + uint32(c.cfg.MaxRecvReorderPackets)
+			if seq > maxSeq {
+				c.recvMu.Unlock()
+				return
+			}
+		}
 		if _, exists := c.recvPackets[seq]; !exists {
+			if c.cfg.MaxRecvReorderBytes > 0 {
+				if c.recvPendingBytes+len(data) > c.cfg.MaxRecvReorderBytes {
+					c.recvMu.Unlock()
+					return
+				}
+			}
 			c.recvPackets[seq] = data
+			c.recvPendingBytes += len(data)
 		}
 	}
 	var toSend [][]byte
@@ -428,8 +456,12 @@ func (c *RTMPConn) enqueueReceived(seq uint32, data []byte) {
 			break
 		}
 		delete(c.recvPackets, c.recvNextSeq)
+		c.recvPendingBytes -= len(d)
 		c.recvNextSeq++
 		toSend = append(toSend, d)
+	}
+	if len(c.recvPackets) == 0 {
+		c.recvPendingBytes = 0
 	}
 	c.recvMu.Unlock()
 	for _, d := range toSend {

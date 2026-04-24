@@ -66,6 +66,7 @@ type ChunkCodec struct {
 	inMu      sync.Mutex
 	outMu     sync.Mutex
 	chunkSize atomic.Int32 // 当前块大小(从SetChunkSize协商)
+	maxMessageSize atomic.Int32
 	InStreams    map[uint32]*InChunkStream
 	OutStreams   map[uint32]*OutChunkStream
 	lastInHeaders  map[uint32]*MessageHeader // 用于头部压缩
@@ -98,6 +99,7 @@ func NewChunkCodec() *ChunkCodec {
 		lastOutHeaders: make(map[uint32]*MessageHeader),
 	}
 	cc.chunkSize.Store(128)
+	cc.maxMessageSize.Store(4 * 1024 * 1024)
 	return cc
 }
 
@@ -105,6 +107,12 @@ func NewChunkCodec() *ChunkCodec {
 func (cc *ChunkCodec) SetChunkSize(size int) {
 	if size > 0 && size <= 65536 {
 		cc.chunkSize.Store(int32(size))
+	}
+}
+
+func (cc *ChunkCodec) SetMaxMessageSize(size int) {
+	if size > 0 {
+		cc.maxMessageSize.Store(int32(size))
 	}
 }
 
@@ -138,8 +146,12 @@ func (cc *ChunkCodec) readChunk(r io.Reader) (*Chunk, error) {
 	var chunkDataLen int
 	if cs.IsFirstChunk || cs.CurrentMessage == nil {
 		// 新消息
+		if maxSize := int(cc.maxMessageSize.Load()); maxSize > 0 && int(mh.MessageLength) > maxSize {
+			return nil, fmt.Errorf("message too large: %d", mh.MessageLength)
+		}
 		cs.ExpectedLength = int(mh.MessageLength)
-		cs.CurrentMessage = make([]byte, 0, mh.MessageLength)
+		capacity := min(int(mh.MessageLength), 4096)
+		cs.CurrentMessage = make([]byte, 0, capacity)
 		cs.CurrentHeader = mh
 		cs.ReceivedBytes = 0
 		cs.IsFirstChunk = false

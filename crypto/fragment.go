@@ -75,6 +75,9 @@ type Reassembler struct {
 	packets    map[uint32]*pendingPacket
 	timeout    time.Duration
 	lastClean  time.Time
+	maxPackets int
+	maxBytes   int
+	pendingBytes int
 }
 
 // pendingPacket 待重组的包
@@ -97,6 +100,13 @@ func NewReassembler(timeout time.Duration) *Reassembler {
 		timeout:   timeout,
 		lastClean: time.Now(),
 	}
+}
+
+func (r *Reassembler) SetLimits(maxPackets, maxBytes int) {
+	r.mu.Lock()
+	r.maxPackets = maxPackets
+	r.maxBytes = maxBytes
+	r.mu.Unlock()
 }
 
 // AddFragment 添加一个分片，如果完整则返回重组后的数据
@@ -124,12 +134,16 @@ func (r *Reassembler) AddFragment(frag []byte) ([]byte, error) {
 
 	pp, exists := r.packets[header.SequenceNum]
 	if !exists {
+		if header.TotalFrags == 0 {
+			return nil, fmt.Errorf("invalid total fragments: %d", header.TotalFrags)
+		}
 		pp = &pendingPacket{
 			seqNum:      header.SequenceNum,
 			fragments:   make(map[uint16][]byte),
 			totalFrags:  header.TotalFrags,
 			firstSeen:   time.Now(),
 		}
+		r.evictIfNeeded(0)
 		r.packets[header.SequenceNum] = pp
 	}
 
@@ -140,9 +154,13 @@ func (r *Reassembler) AddFragment(frag []byte) ([]byte, error) {
 
 	// 存储分片(去重)
 	if _, exists := pp.fragments[header.FragmentIdx]; !exists {
-		pp.fragments[header.FragmentIdx] = payload
+		cp := make([]byte, len(payload))
+		copy(cp, payload)
+		r.evictIfNeeded(len(cp))
+		pp.fragments[header.FragmentIdx] = cp
 		pp.receivedFrags++
-		pp.totalLen += len(payload)
+		pp.totalLen += len(cp)
+		r.pendingBytes += len(cp)
 	}
 
 	// 检查是否完整
@@ -160,10 +178,49 @@ func (r *Reassembler) AddFragment(frag []byte) ([]byte, error) {
 			off += len(data)
 		}
 		delete(r.packets, header.SequenceNum)
+		r.pendingBytes -= pp.totalLen
+		if r.pendingBytes < 0 {
+			r.pendingBytes = 0
+		}
 		return out, nil
 	}
 
 	return nil, nil // 还未完整
+}
+
+func (r *Reassembler) evictIfNeeded(incomingBytes int) {
+	for {
+		if r.maxPackets > 0 && len(r.packets) >= r.maxPackets {
+			r.evictOldest()
+			continue
+		}
+		if r.maxBytes > 0 && r.pendingBytes+incomingBytes > r.maxBytes {
+			r.evictOldest()
+			continue
+		}
+		break
+	}
+}
+
+func (r *Reassembler) evictOldest() {
+	var (
+		oldestSeq uint32
+		oldest    *pendingPacket
+	)
+	for seq, pp := range r.packets {
+		if oldest == nil || pp.firstSeen.Before(oldest.firstSeen) {
+			oldest = pp
+			oldestSeq = seq
+		}
+	}
+	if oldest == nil {
+		return
+	}
+	delete(r.packets, oldestSeq)
+	r.pendingBytes -= oldest.totalLen
+	if r.pendingBytes < 0 {
+		r.pendingBytes = 0
+	}
 }
 
 // cleanup 清理超时的待重组包
@@ -175,7 +232,11 @@ func (r *Reassembler) cleanup() {
 	for seqNum, pp := range r.packets {
 		if now.Sub(pp.firstSeen) > r.timeout {
 			delete(r.packets, seqNum)
+			r.pendingBytes -= pp.totalLen
 		}
+	}
+	if r.pendingBytes < 0 {
+		r.pendingBytes = 0
 	}
 	r.lastClean = now
 }

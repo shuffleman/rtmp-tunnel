@@ -336,9 +336,37 @@ func (c *RTMPConn) encryptAndSend(data []byte) {
 
 	// 标记有代理数据等待嵌入
 	c.pendingMu.Lock()
+	addBytes := 0
+	for _, frag := range frags {
+		addBytes += len(frag)
+	}
+	maxFragLimit := c.cfg.MaxPendingProxyFragments
+	if maxFragLimit > 0 && len(frags) > maxFragLimit {
+		maxFragLimit = 0
+	}
+	maxBytesLimit := c.cfg.MaxPendingProxyBytes
+	if maxBytesLimit > 0 && addBytes > maxBytesLimit {
+		maxBytesLimit = 0
+	}
+	for c.ctx.Err() == nil {
+		if maxFragLimit > 0 && len(c.pendingProxyData)+len(frags) > maxFragLimit {
+			c.pendingCond.Wait()
+			continue
+		}
+		if maxBytesLimit > 0 && c.pendingBytes+addBytes > maxBytesLimit {
+			c.pendingCond.Wait()
+			continue
+		}
+		break
+	}
+	if c.ctx.Err() != nil {
+		c.pendingMu.Unlock()
+		return
+	}
 	for _, frag := range frags {
 		c.pendingProxyData = append(c.pendingProxyData, frag)
 	}
+	c.pendingBytes += addBytes
 	c.pendingMu.Unlock()
 }
 
@@ -365,6 +393,18 @@ func (c *RTMPConn) getPendingProxyDataBatch(max int) [][]byte {
 	}
 	data := c.pendingProxyData[:max]
 	c.pendingProxyData = c.pendingProxyData[max:]
+	removedBytes := 0
+	for _, d := range data {
+		removedBytes += len(d)
+	}
+	c.pendingBytes -= removedBytes
+	if c.pendingBytes < 0 {
+		c.pendingBytes = 0
+	}
+	if len(c.pendingProxyData) == 0 {
+		c.pendingProxyData = nil
+	}
+	c.pendingCond.Broadcast()
 	out := make([][]byte, len(data))
 	copy(out, data)
 	return out
