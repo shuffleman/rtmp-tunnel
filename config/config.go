@@ -12,7 +12,7 @@ type Config struct {
 	AppName string `json:"appName" yaml:"appName"`
 
 	// 流标识
-	PublishStreamName  string `json:"publishStreamName" yaml:"publishStreamName"`  // 上行流名称（如主播推流）
+	PublishStreamName  string `json:"publishStreamName" yaml:"publishStreamName"`   // 上行流名称（如主播推流）
 	PlaybackStreamName string `json:"playbackStreamName" yaml:"playbackStreamName"` // 下行流名称（如观众播放）
 
 	// 伪装码率控制
@@ -33,14 +33,15 @@ type Config struct {
 	} `json:"encryption" yaml:"encryption"`
 
 	// 性能调优
-	WriteBufferSize    int           `json:"writeBufferSize" yaml:"writeBufferSize"`       // 写缓冲区大小
-	ReadBufferSize     int           `json:"readBufferSize" yaml:"readBufferSize"`         // 读缓冲区大小
-	FlushInterval      time.Duration `json:"flushInterval" yaml:"flushInterval"`           // 写刷新间隔
-	WriteBatchSize     int           `json:"writeBatchSize" yaml:"writeBatchSize"`         // 批量写入阈值
-	MaxSEISize         int           `json:"maxSEISize" yaml:"maxSEISize"`                 // 单个SEI最大负载
-	MaxSEIPerFrame     int           `json:"maxSEIPerFrame" yaml:"maxSEIPerFrame"`         // 每帧最多嵌入的SEI数量
-	MaxFramePayloadSize int          `json:"maxFramePayloadSize" yaml:"maxFramePayloadSize"`
-	TimestampJitterMax int           `json:"timestampJitterMax" yaml:"timestampJitterMax"` // 时间戳最大抖动(ms)
+	WriteBufferSize     int           `json:"writeBufferSize" yaml:"writeBufferSize"` // 写缓冲区大小
+	ReadBufferSize      int           `json:"readBufferSize" yaml:"readBufferSize"`   // 读缓冲区大小
+	FlushInterval       time.Duration `json:"flushInterval" yaml:"flushInterval"`     // 写刷新间隔
+	WriteBatchSize      int           `json:"writeBatchSize" yaml:"writeBatchSize"`   // 批量写入阈值
+	MaxSEISize          int           `json:"maxSEISize" yaml:"maxSEISize"`           // 单个SEI最大负载
+	MaxSEIPerFrame      int           `json:"maxSEIPerFrame" yaml:"maxSEIPerFrame"`   // 每帧最多嵌入的SEI数量
+	MaxFramePayloadSize int           `json:"maxFramePayloadSize" yaml:"maxFramePayloadSize"`
+	TimestampJitterMax  int           `json:"timestampJitterMax" yaml:"timestampJitterMax"` // 时间戳最大抖动(ms)
+	NetworkWriteTimeout time.Duration `json:"networkWriteTimeout" yaml:"networkWriteTimeout"`
 
 	// 内存保护/背压
 	MaxPendingProxyBytes     int `json:"maxPendingProxyBytes" yaml:"maxPendingProxyBytes"`
@@ -70,22 +71,23 @@ type Config struct {
 // DefaultConfig 返回默认配置
 func DefaultConfig() *Config {
 	c := &Config{
-		AppName:            "live",
-		PublishStreamName:  "stream_pub",
-		PlaybackStreamName: "stream_play",
-		TargetBitrate:      5_000_000, // 5 Mbps
-		FrameRate:          30,
-		GOPSize:            60,
-		InitialChunkSize:   128,
-		MaxChunkSize:       4096,
-		WriteBufferSize:    64 * 1024,
-		ReadBufferSize:     64 * 1024,
-		FlushInterval:      5 * time.Millisecond,
-		WriteBatchSize:     16 * 1024,
-		MaxSEISize:         1400, // 小于MTU避免分片
-		MaxSEIPerFrame:     4,
-		MaxFramePayloadSize: 4096,
-		TimestampJitterMax: 5,    // ±5ms抖动
+		AppName:                  "live",
+		PublishStreamName:        "stream_pub",
+		PlaybackStreamName:       "stream_play",
+		TargetBitrate:            5_000_000, // 5 Mbps
+		FrameRate:                30,
+		GOPSize:                  60,
+		InitialChunkSize:         128,
+		MaxChunkSize:             4096,
+		WriteBufferSize:          64 * 1024,
+		ReadBufferSize:           64 * 1024,
+		FlushInterval:            5 * time.Millisecond,
+		WriteBatchSize:           16 * 1024,
+		MaxSEISize:               1400, // 小于MTU避免分片
+		MaxSEIPerFrame:           4,
+		MaxFramePayloadSize:      4096,
+		TimestampJitterMax:       5, // ±5ms抖动
+		NetworkWriteTimeout:      10 * time.Second,
 		MaxPendingProxyBytes:     8 * 1024 * 1024,
 		MaxPendingProxyFragments: 8192,
 		MaxReassemblyPackets:     1024,
@@ -139,6 +141,9 @@ func (c *Config) Validate() error {
 	}
 	if c.FlushInterval <= 0 {
 		c.FlushInterval = 5 * time.Millisecond
+	}
+	if c.NetworkWriteTimeout < 0 {
+		c.NetworkWriteTimeout = 0
 	}
 	if c.MaxPendingProxyBytes < 0 {
 		c.MaxPendingProxyBytes = 0

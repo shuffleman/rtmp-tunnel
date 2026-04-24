@@ -10,19 +10,19 @@ import (
 
 // Message RTMP完整消息
 type Message struct {
-	Type       uint8
-	StreamID   uint32
-	Timestamp  uint32
-	Payload    []byte
+	Type          uint8
+	StreamID      uint32
+	Timestamp     uint32
+	Payload       []byte
 	ChunkStreamID uint32
 }
 
 // ControlMessages 控制消息处理器
 type ControlMessages struct {
-	chunkCodec      *ChunkCodec
-	peerChunkSize   int
-	peerWindowSize  uint32
-	peerBandwidth   uint32
+	chunkCodec        *ChunkCodec
+	peerChunkSize     int
+	peerWindowSize    uint32
+	peerBandwidth     uint32
 	onChunkSizeChange func(int)
 }
 
@@ -195,7 +195,7 @@ func (cm *ControlMessages) SendInitialControlMessages(w io.Writer, chunkSize int
 }
 
 // StartControlMessageLoop 启动控制消息维护循环(周期性ping/ack)
-func (cm *ControlMessages) StartControlMessageLoop(w io.Writer, done <-chan struct{}) {
+func (cm *ControlMessages) StartControlMessageLoop(w io.Writer, done <-chan struct{}, onError func(error)) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
@@ -207,11 +207,21 @@ func (cm *ControlMessages) StartControlMessageLoop(w io.Writer, done <-chan stru
 		case <-ticker.C:
 			// 发送ping
 			ts := uint32(time.Now().Unix())
-			cm.SendPingRequest(w, ts)
-			
+			if err := cm.SendPingRequest(w, ts); err != nil {
+				if onError != nil {
+					onError(err)
+				}
+				return
+			}
+
 			// 发送ack
 			bytesReceived += 100000 // 应由实际接收更新
-			cm.SendAck(w, bytesReceived)
+			if err := cm.SendAck(w, bytesReceived); err != nil {
+				if onError != nil {
+					onError(err)
+				}
+				return
+			}
 		}
 	}
 }

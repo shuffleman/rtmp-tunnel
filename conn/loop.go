@@ -28,7 +28,7 @@ func (c *RTMPConn) clientLoop() {
 
 	// 启动控制消息维护
 	done := make(chan struct{})
-	go c.ctrlMsgs.StartControlMessageLoop(c.tcpConn, done)
+	go c.ctrlMsgs.StartControlMessageLoop(c.tcpConn, done, c.fail)
 
 	// 等待连接关闭
 	<-c.ctx.Done()
@@ -48,7 +48,7 @@ func (c *RTMPConn) serverLoop() {
 
 	// 控制消息维护
 	done := make(chan struct{})
-	go c.ctrlMsgs.StartControlMessageLoop(c.tcpConn, done)
+	go c.ctrlMsgs.StartControlMessageLoop(c.tcpConn, done, c.fail)
 
 	// 等待连接关闭
 	<-c.ctx.Done()
@@ -105,10 +105,7 @@ func (c *RTMPConn) readLoop() {
 				time.Sleep(10 * time.Millisecond)
 				continue
 			}
-			select {
-			case c.errCh <- fmt.Errorf("read message: %w", err):
-			case <-c.ctx.Done():
-			}
+			c.fail(fmt.Errorf("read message: %w", err))
 			return
 		}
 
@@ -116,10 +113,7 @@ func (c *RTMPConn) readLoop() {
 
 		// 处理消息
 		if err := c.handleIncomingMessage(chunk, payload); err != nil {
-			select {
-			case c.errCh <- err:
-			case <-c.ctx.Done():
-			}
+			c.fail(err)
 			return
 		}
 	}
@@ -132,8 +126,14 @@ func (c *RTMPConn) frameGenerationLoop() {
 	defer ticker.Stop()
 
 	// 发送初始序列头
-	c.sendVideoSequenceHeader()
-	c.sendAudioSequenceHeader()
+	if err := c.sendVideoSequenceHeader(); err != nil {
+		c.fail(err)
+		return
+	}
+	if err := c.sendAudioSequenceHeader(); err != nil {
+		c.fail(err)
+		return
+	}
 
 	frameCount := 0
 	lastIdleSend := time.Now()
@@ -161,11 +161,13 @@ func (c *RTMPConn) frameGenerationLoop() {
 
 			// 生成视频帧
 			if err := c.sendVideoFrame(); err != nil {
+				c.fail(err)
 				return
 			}
 
 			if sendAudio {
 				if err := c.sendAudioFrame(); err != nil {
+					c.fail(err)
 					return
 				}
 			}
@@ -519,22 +521,24 @@ func (c *RTMPConn) handleServerPublish(cmd *command.Command) error {
 	// 发送onStatus响应
 	status := command.BuildPublishStatus(c.streamID, true)
 	msg, _ := status.ToMessage(3)
-	c.chunkCodec.WriteChunk(c.tcpConn, msg.ChunkStreamID, msg.Type, msg.StreamID, msg.Timestamp, msg.Payload)
+	if err := c.chunkCodec.WriteChunk(c.tcpConn, msg.ChunkStreamID, msg.Type, msg.StreamID, msg.Timestamp, msg.Payload); err != nil {
+		return err
+	}
 
 	// 发送StreamBegin
-	c.ctrlMsgs.SendStreamBegin(c.tcpConn, uint32(c.streamID))
-	return nil
+	return c.ctrlMsgs.SendStreamBegin(c.tcpConn, uint32(c.streamID))
 }
 
 func (c *RTMPConn) handleServerPlay(cmd *command.Command) error {
 	// 发送onStatus响应
 	status := command.BuildPlayStatus(c.streamID)
 	msg, _ := status.ToMessage(3)
-	c.chunkCodec.WriteChunk(c.tcpConn, msg.ChunkStreamID, msg.Type, msg.StreamID, msg.Timestamp, msg.Payload)
+	if err := c.chunkCodec.WriteChunk(c.tcpConn, msg.ChunkStreamID, msg.Type, msg.StreamID, msg.Timestamp, msg.Payload); err != nil {
+		return err
+	}
 
 	// 发送StreamBegin
-	c.ctrlMsgs.SendStreamBegin(c.tcpConn, uint32(c.streamID))
-	return nil
+	return c.ctrlMsgs.SendStreamBegin(c.tcpConn, uint32(c.streamID))
 }
 
 func (c *RTMPConn) handleServerClose(cmd *command.Command) error {

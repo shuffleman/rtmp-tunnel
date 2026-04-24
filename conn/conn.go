@@ -60,9 +60,9 @@ type RTMPConn struct {
 	readDeadlineUnixNano  atomic.Int64
 	writeDeadlineUnixNano atomic.Int64
 
-	recvMu      sync.Mutex
-	recvNextSeq uint32
-	recvPackets map[uint32][]byte
+	recvMu           sync.Mutex
+	recvNextSeq      uint32
+	recvPackets      map[uint32][]byte
 	recvPendingBytes int
 
 	// 控制
@@ -156,7 +156,7 @@ func (c *RTMPConn) Dial(addr string) error {
 		tcpConn.Close()
 		return err
 	}
-	c.tcpConn = &writeLockedConn{Conn: tcpConn, mu: &c.tcpWriteMu}
+	c.tcpConn = &writeLockedConn{Conn: tcpConn, mu: &c.tcpWriteMu, writeTimeout: c.cfg.NetworkWriteTimeout}
 	c.isServer = false
 
 	// 执行客户端握手
@@ -193,7 +193,7 @@ func (c *RTMPConn) Accept(listener net.Listener) error {
 		tcpConn.Close()
 		return err
 	}
-	c.tcpConn = &writeLockedConn{Conn: tcpConn, mu: &c.tcpWriteMu}
+	c.tcpConn = &writeLockedConn{Conn: tcpConn, mu: &c.tcpWriteMu, writeTimeout: c.cfg.NetworkWriteTimeout}
 	c.isServer = true
 
 	// 执行服务端握手
@@ -219,7 +219,7 @@ func (c *RTMPConn) Wrap(tcpConn net.Conn, isServer bool) error {
 	if err := c.configureTCP(tcpConn); err != nil {
 		return err
 	}
-	c.tcpConn = &writeLockedConn{Conn: tcpConn, mu: &c.tcpWriteMu}
+	c.tcpConn = &writeLockedConn{Conn: tcpConn, mu: &c.tcpWriteMu, writeTimeout: c.cfg.NetworkWriteTimeout}
 	c.isServer = isServer
 	c.handshaker = protocol.NewHandshaker(isServer)
 
@@ -372,6 +372,16 @@ func (c *RTMPConn) Close() error {
 		c.state = StateClosed
 	})
 	return nil
+}
+
+func (c *RTMPConn) fail(err error) {
+	if err != nil {
+		select {
+		case c.errCh <- err:
+		default:
+		}
+	}
+	_ = c.Close()
 }
 
 // LocalAddr 返回本地地址
@@ -529,11 +539,15 @@ func (timeoutError) Temporary() bool { return true }
 
 type writeLockedConn struct {
 	net.Conn
-	mu *sync.Mutex
+	mu           *sync.Mutex
+	writeTimeout time.Duration
 }
 
 func (c *writeLockedConn) Write(p []byte) (int, error) {
 	c.mu.Lock()
+	if c.writeTimeout > 0 {
+		_ = c.Conn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
+	}
 	n, err := c.Conn.Write(p)
 	c.mu.Unlock()
 	return n, err
