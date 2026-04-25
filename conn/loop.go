@@ -3,6 +3,7 @@ package conn
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -75,6 +76,7 @@ func (c *RTMPConn) writeLoop() {
 				batch.Reset()
 			}
 			batch.Write(data)
+			c.putWriteBuf(data)
 
 		case <-ticker.C:
 			if batch.Len() > 0 {
@@ -407,9 +409,7 @@ func (c *RTMPConn) getPendingProxyDataBatch(max int) [][]byte {
 		c.pendingProxyData = nil
 	}
 	c.pendingCond.Broadcast()
-	out := make([][]byte, len(data))
-	copy(out, data)
-	return out
+	return data
 }
 
 // sendVideoFrame 发送单个视频帧
@@ -433,20 +433,36 @@ func (c *RTMPConn) sendVideoFrame() error {
 		frameType = container.FrameTypeKeyFrame
 	}
 
-	tag, err := c.flvContainer.BuildVideoTag(ts, frameType, container.AVCNALU, 0, nalus)
-	if err != nil {
-		return err
+	msgLen := 5
+	for _, nalu := range nalus {
+		msgLen += 4 + len(nalu)
 	}
+	var header [5]byte
+	header[0] = (frameType&0x0F)<<4 | (container.VideoCodecAVC & 0x0F)
+	header[1] = container.AVCNALU
 
-	// 发送RTMP消息
-	payload := container.TagToRTMPMessage(tag)
+	prefixBuf := c.getVideoPayloadBuf()
+	if cap(prefixBuf) < 4*len(nalus) {
+		prefixBuf = make([]byte, 4*len(nalus))
+	} else {
+		prefixBuf = prefixBuf[:4*len(nalus)]
+	}
+	parts := make([][]byte, 0, 1+len(nalus)*2)
+	parts = append(parts, header[:])
+	for i, nalu := range nalus {
+		p := prefixBuf[i*4 : (i+1)*4]
+		binary.BigEndian.PutUint32(p, uint32(len(nalu)))
+		parts = append(parts, p, nalu)
+	}
 	csID := uint32(4) // 视频块流
-	if err := c.chunkCodec.WriteChunk(c.tcpConn, csID, container.TagTypeVideo, 1, ts, payload); err != nil {
+	if err := c.chunkCodec.WriteChunkParts(c.tcpConn, csID, container.TagTypeVideo, 1, ts, msgLen, parts...); err != nil {
+		c.putVideoPayloadBuf(prefixBuf)
 		return err
 	}
+	c.putVideoPayloadBuf(prefixBuf)
 
 	c.framesSent.Add(1)
-	c.bytesSent.Add(uint64(len(payload)))
+	c.bytesSent.Add(uint64(msgLen))
 	return nil
 }
 
@@ -471,14 +487,34 @@ func (c *RTMPConn) sendVideoSequenceHeader() error {
 	nalus := c.gopSim.BuildSequenceHeader()
 	ts := uint32(0)
 
-	tag, err := c.flvContainer.BuildVideoTag(ts, container.FrameTypeKeyFrame, container.AVCSequenceHeader, 0, nalus)
-	if err != nil {
+	msgLen := 5
+	for _, nalu := range nalus {
+		msgLen += 4 + len(nalu)
+	}
+	var header [5]byte
+	header[0] = (container.FrameTypeKeyFrame&0x0F)<<4 | (container.VideoCodecAVC & 0x0F)
+	header[1] = container.AVCSequenceHeader
+
+	prefixBuf := c.getVideoPayloadBuf()
+	if cap(prefixBuf) < 4*len(nalus) {
+		prefixBuf = make([]byte, 4*len(nalus))
+	} else {
+		prefixBuf = prefixBuf[:4*len(nalus)]
+	}
+	parts := make([][]byte, 0, 1+len(nalus)*2)
+	parts = append(parts, header[:])
+	for i, nalu := range nalus {
+		p := prefixBuf[i*4 : (i+1)*4]
+		binary.BigEndian.PutUint32(p, uint32(len(nalu)))
+		parts = append(parts, p, nalu)
+	}
+	csID := uint32(4)
+	if err := c.chunkCodec.WriteChunkParts(c.tcpConn, csID, container.TagTypeVideo, 1, ts, msgLen, parts...); err != nil {
+		c.putVideoPayloadBuf(prefixBuf)
 		return err
 	}
-
-	payload := container.TagToRTMPMessage(tag)
-	csID := uint32(4)
-	return c.chunkCodec.WriteChunk(c.tcpConn, csID, container.TagTypeVideo, 1, ts, payload)
+	c.putVideoPayloadBuf(prefixBuf)
+	return nil
 }
 
 // sendAudioSequenceHeader 发送音频序列头

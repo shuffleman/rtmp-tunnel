@@ -9,6 +9,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"sync/atomic"
+
+	"golang.org/x/crypto/chacha20poly1305"
 )
 
 // Cipher 加密接口
@@ -114,11 +116,68 @@ func (c *AESCipher) Decrypt(ciphertext []byte) ([]byte, error) {
 	return plaintext, nil
 }
 
+// ChaCha20Poly1305Cipher ChaCha20-Poly1305 加密
+type ChaCha20Poly1305Cipher struct {
+	aead    cipher.AEAD
+	prefix  [4]byte
+	counter atomic.Uint64
+}
+
+func NewChaCha20Poly1305Cipher(key []byte) (*ChaCha20Poly1305Cipher, error) {
+	derivedKey := sha256.Sum256(key)
+	aead, err := chacha20poly1305.New(derivedKey[:])
+	if err != nil {
+		return nil, fmt.Errorf("create chacha20-poly1305: %w", err)
+	}
+	c := &ChaCha20Poly1305Cipher{aead: aead}
+	_, _ = rand.Read(c.prefix[:])
+	return c, nil
+}
+
+func (c *ChaCha20Poly1305Cipher) Encrypt(plaintext []byte) ([]byte, error) {
+	nonceSize := c.aead.NonceSize()
+	var nonceBuf [32]byte
+	if nonceSize > len(nonceBuf) {
+		return nil, fmt.Errorf("unsupported nonce size: %d", nonceSize)
+	}
+	nonce := nonceBuf[:nonceSize]
+	copy(nonce, c.prefix[:])
+	ctr := c.counter.Add(1)
+	if nonceSize >= 12 {
+		binary.BigEndian.PutUint64(nonce[nonceSize-8:], ctr)
+	} else if nonceSize >= 8 {
+		binary.BigEndian.PutUint64(nonce[:8], ctr)
+	} else {
+		for i := 0; i < nonceSize; i++ {
+			nonce[nonceSize-1-i] = byte(ctr >> (8 * i))
+		}
+	}
+	out := make([]byte, nonceSize, nonceSize+len(plaintext)+c.aead.Overhead())
+	copy(out, nonce)
+	out = c.aead.Seal(out, nonce, plaintext, nil)
+	return out, nil
+}
+
+func (c *ChaCha20Poly1305Cipher) Decrypt(ciphertext []byte) ([]byte, error) {
+	nonceSize := c.aead.NonceSize()
+	if len(ciphertext) < nonceSize {
+		return nil, fmt.Errorf("ciphertext too short")
+	}
+	nonce, ct := ciphertext[:nonceSize], ciphertext[nonceSize:]
+	plaintext, err := c.aead.Open(nil, nonce, ct, nil)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt: %w", err)
+	}
+	return plaintext, nil
+}
+
 // NewCipher 根据配置创建加密器
 func NewCipher(algorithm string, key []byte) (Cipher, error) {
 	switch algorithm {
 	case "aes-256-gcm", "aes-128-gcm", "aes-gcm":
 		return NewAESCipher(key)
+	case "chacha20-poly1305", "chacha-poly1305", "chacha20poly1305":
+		return NewChaCha20Poly1305Cipher(key)
 	case "xor":
 		return NewXORCipher(key), nil
 	default:

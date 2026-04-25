@@ -77,13 +77,13 @@ func (gs *GOPSimulator) SetResolution(width, height int) {
 // generateJitterPattern 生成时间戳抖动模式
 func (gs *GOPSimulator) generateJitterPattern() {
 	maxJitter := gs.cfg.TimestampJitterMax
+	var randBits [1]byte
 	for i := 0; i < gs.cfg.FrameRate; i++ {
 		// 使用正弦波+随机噪声生成自然抖动
 		phase := 2 * math.Pi * float64(i) / float64(gs.cfg.FrameRate)
 		jitter := int(math.Sin(phase) * float64(maxJitter) * 0.5)
 		// 添加小随机扰动
-		randBits := make([]byte, 1)
-		crand.Read(randBits)
+		_, _ = crand.Read(randBits[:])
 		jitter += int(randBits[0]%3) - 1
 		gs.jitterBuf = append(gs.jitterBuf, jitter)
 	}
@@ -104,7 +104,11 @@ func (gs *GOPSimulator) NextFrameMulti(proxyDataList [][]byte) (frameType uint8,
 	// 计算时间戳
 	ts := gs.calcTimestamp()
 
-	var frameNALUs [][]byte
+	capHint := 2 + len(proxyDataList)
+	if isIDR {
+		capHint += 2
+	}
+	frameNALUs := make([][]byte, 0, capHint)
 
 	// 1. AUD (每个帧开始)
 	frameNALUs = append(frameNALUs, gs.encoder.BuildAUD(0))
@@ -141,6 +145,7 @@ func (gs *GOPSimulator) NextFrameMulti(proxyDataList [][]byte) (frameType uint8,
 		idrNALU := gs.encoder.BuildIDRSlice(gs.mbCount, idrPayload)
 		frameNALUs = append(frameNALUs, idrNALU)
 
+		gs.frameNum++
 		return container.FrameTypeKeyFrame, ts, frameNALUs, nil
 	}
 

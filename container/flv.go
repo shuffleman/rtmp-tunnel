@@ -35,11 +35,11 @@ const (
 	AACRaw            = 1 // 原始AAC帧
 
 	// 帧类型
-	FrameTypeKeyFrame    = 1 // 关键帧(IDR)
-	FrameTypeInterFrame  = 2 // 非关键帧(P帧)
-	FrameTypeDisposable  = 3 // 可丢弃的非关键帧(H.263 only)
-	FrameTypeGenerated   = 4 // 关键帧生成的帧
-	FrameTypeVideoInfo   = 5 // 视频信息/命令帧
+	FrameTypeKeyFrame   = 1 // 关键帧(IDR)
+	FrameTypeInterFrame = 2 // 非关键帧(P帧)
+	FrameTypeDisposable = 3 // 可丢弃的非关键帧(H.263 only)
+	FrameTypeGenerated  = 4 // 关键帧生成的帧
+	FrameTypeVideoInfo  = 5 // 视频信息/命令帧
 )
 
 // FLVHeader FLV文件头
@@ -52,10 +52,10 @@ type FLVHeader struct {
 
 // TagHeader FLV标签头
 type TagHeader struct {
-	Type       uint8  // 标签类型
-	DataSize   uint32 // 数据大小(3字节)
-	Timestamp  uint32 // 时间戳(3字节 + 1字节扩展)
-	StreamID   uint32 // 流ID(3字节，总是0)
+	Type      uint8  // 标签类型
+	DataSize  uint32 // 数据大小(3字节)
+	Timestamp uint32 // 时间戳(3字节 + 1字节扩展)
+	StreamID  uint32 // 流ID(3字节，总是0)
 }
 
 // Tag 完整FLV标签
@@ -66,10 +66,10 @@ type Tag struct {
 
 // VideoTagData 视频标签数据结构
 type VideoTagData struct {
-	FrameType       uint8  // 4 bits
-	CodecID         uint8  // 4 bits
-	AVCPacketType   uint8  // 1 byte
-	CompositionTime int32  // 3 bytes (有符号)
+	FrameType       uint8    // 4 bits
+	CodecID         uint8    // 4 bits
+	AVCPacketType   uint8    // 1 byte
+	CompositionTime int32    // 3 bytes (有符号)
 	NALUs           [][]byte // NAL单元列表
 }
 
@@ -85,7 +85,7 @@ type AudioTagData struct {
 
 // FLVContainer FLV容器
 type FLVContainer struct {
-	startTime time.Time
+	startTime     time.Time
 	baseTimestamp uint32
 }
 
@@ -234,6 +234,29 @@ func (fc *FLVContainer) BuildVideoTag(timestamp uint32, frameType, avcPacketType
 	}, nil
 }
 
+func (fc *FLVContainer) BuildVideoPayload(dst []byte, frameType, avcPacketType uint8, compositionTime int32, nalus [][]byte) ([]byte, error) {
+	dataSize := 5
+	for _, nalu := range nalus {
+		dataSize += 4 + len(nalu)
+	}
+	if cap(dst) < dataSize {
+		dst = make([]byte, dataSize)
+	} else {
+		dst = dst[:dataSize]
+	}
+	dst[0] = (frameType&0x0F)<<4 | (VideoCodecAVC & 0x0F)
+	dst[1] = avcPacketType
+	writeInt24(dst[2:5], compositionTime)
+
+	offset := 5
+	for _, nalu := range nalus {
+		binary.BigEndian.PutUint32(dst[offset:offset+4], uint32(len(nalu)))
+		copy(dst[offset+4:], nalu)
+		offset += 4 + len(nalu)
+	}
+	return dst, nil
+}
+
 // BuildAudioTag 构建音频标签
 func (fc *FLVContainer) BuildAudioTag(timestamp uint32, aacPacketType uint8, payload []byte) (*Tag, error) {
 	// SoundFormat(4) | SoundRate(2) | SoundSize(1) | SoundType(1) = 1 byte
@@ -314,9 +337,9 @@ func (fc *FLVContainer) ParseVideoTag(data []byte) (*VideoTagData, error) {
 	}
 
 	vd := &VideoTagData{
-		FrameType:     (data[0] >> 4) & 0x0F,
-		CodecID:       data[0] & 0x0F,
-		AVCPacketType: data[1],
+		FrameType:       (data[0] >> 4) & 0x0F,
+		CodecID:         data[0] & 0x0F,
+		AVCPacketType:   data[1],
 		CompositionTime: int32(readInt24(data[2:5])),
 	}
 

@@ -359,10 +359,27 @@ func insertEmulationPrevention(nalu []byte) []byte {
 		return nalu
 	}
 
+	zeroCount := 0
+	for i := 0; i < len(nalu); i++ {
+		b := nalu[i]
+		if zeroCount == 2 && (b == 0 || b == 1 || b == 2 || b == 3) {
+			goto needInsert
+		}
+		if b == 0 {
+			if zeroCount < 2 {
+				zeroCount++
+			}
+		} else {
+			zeroCount = 0
+		}
+	}
+	return nalu
+
+needInsert:
 	result := make([]byte, 0, len(nalu)+len(nalu)/100)
 	result = append(result, nalu[0], nalu[1])
 
-	zeroCount := 0
+	zeroCount = 0
 	if nalu[0] == 0 {
 		zeroCount++
 	}

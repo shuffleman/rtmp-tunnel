@@ -63,31 +63,45 @@ type Chunk struct {
 
 // ChunkCodec 块的编解码器
 type ChunkCodec struct {
-	inMu      sync.Mutex
-	outMu     sync.Mutex
-	chunkSize atomic.Int32 // 当前块大小(从SetChunkSize协商)
+	inMu           sync.Mutex
+	outMu          sync.Mutex
+	chunkSize      atomic.Int32 // 当前块大小(从SetChunkSize协商)
 	maxMessageSize atomic.Int32
-	InStreams    map[uint32]*InChunkStream
-	OutStreams   map[uint32]*OutChunkStream
+	InStreams      map[uint32]*InChunkStream
+	OutStreams     map[uint32]*OutChunkStream
 	lastInHeaders  map[uint32]*MessageHeader // 用于头部压缩
 	lastOutHeaders map[uint32]*MessageHeader
 }
 
+func writeFull(w io.Writer, b []byte) error {
+	for len(b) > 0 {
+		n, err := w.Write(b)
+		if err != nil {
+			return err
+		}
+		if n <= 0 {
+			return io.ErrShortWrite
+		}
+		b = b[n:]
+	}
+	return nil
+}
+
 // InChunkStream 输入块流状态
 type InChunkStream struct {
-	StreamID        uint32
-	ReceivedBytes   int      // 已接收字节
-	ExpectedLength  int      // 消息总长度
-	CurrentMessage  []byte   // 正在组装的消息
-	CurrentHeader   *MessageHeader
-	IsFirstChunk    bool
+	StreamID       uint32
+	ReceivedBytes  int    // 已接收字节
+	ExpectedLength int    // 消息总长度
+	CurrentMessage []byte // 正在组装的消息
+	CurrentHeader  *MessageHeader
+	IsFirstChunk   bool
 }
 
 // OutChunkStream 输出块流状态
 type OutChunkStream struct {
-	StreamID     uint32
-	LastHeader   *MessageHeader
-	SequenceNum  uint32
+	StreamID    uint32
+	LastHeader  *MessageHeader
+	SequenceNum uint32
 }
 
 // NewChunkCodec 创建块编解码器
@@ -239,6 +253,19 @@ func (cc *ChunkCodec) WriteChunk(w io.Writer, csID uint32, msgType uint8, stream
 	if msgLen == 0 {
 		return nil
 	}
+	return cc.writeChunkParts(w, csID, msgType, streamID, timestamp, msgLen, data)
+}
+
+func (cc *ChunkCodec) WriteChunkParts(w io.Writer, csID uint32, msgType uint8, streamID uint32, timestamp uint32, msgLen int, parts ...[]byte) error {
+	cc.outMu.Lock()
+	defer cc.outMu.Unlock()
+	if msgLen <= 0 {
+		return nil
+	}
+	return cc.writeChunkParts(w, csID, msgType, streamID, timestamp, msgLen, parts...)
+}
+
+func (cc *ChunkCodec) writeChunkParts(w io.Writer, csID uint32, msgType uint8, streamID uint32, timestamp uint32, msgLen int, parts ...[]byte) error {
 
 	// 确定消息头格式
 	format := uint8(0) // 首次使用类型0完整头
@@ -254,14 +281,15 @@ func (cc *ChunkCodec) WriteChunk(w io.Writer, csID uint32, msgType uint8, stream
 
 	offset := 0
 	isFirst := true
+	partIndex := 0
+	partOffset := 0
 
 	for offset < msgLen {
 		chunkLen := min(msgLen-offset, cc.getChunkSize())
-		chunkData := data[offset : offset+chunkLen]
-
 		if isFirst {
 			// 写基本头(格式0/1/2)
 			if err := cc.writeBasicHeader(w, format, csID); err != nil {
+				return err
 				return err
 			}
 			if err := cc.writeMessageHeader(w, format, csID, timestamp, uint32(msgLen), msgType, streamID); err != nil {
@@ -275,12 +303,39 @@ func (cc *ChunkCodec) WriteChunk(w io.Writer, csID uint32, msgType uint8, stream
 			}
 		}
 
-		// 写块数据
-		if _, err := w.Write(chunkData); err != nil {
-			return fmt.Errorf("write chunk payload: %w", err)
+		remaining := chunkLen
+		for remaining > 0 {
+			for partIndex < len(parts) && partOffset >= len(parts[partIndex]) {
+				partIndex++
+				partOffset = 0
+			}
+			if partIndex >= len(parts) {
+				return fmt.Errorf("write chunk payload: insufficient parts")
+			}
+			p := parts[partIndex][partOffset:]
+			n := len(p)
+			if n > remaining {
+				n = remaining
+			}
+			if err := writeFull(w, p[:n]); err != nil {
+				return fmt.Errorf("write chunk payload: %w", err)
+			}
+			partOffset += n
+			remaining -= n
 		}
 
 		offset += chunkLen
+	}
+	for partIndex < len(parts) && partOffset >= len(parts[partIndex]) {
+		partIndex++
+		partOffset = 0
+	}
+	if partIndex < len(parts) {
+		for i := partIndex; i < len(parts); i++ {
+			if len(parts[i]) > 0 {
+				return fmt.Errorf("write chunk payload: too many parts")
+			}
+		}
 	}
 
 	// 更新最后输出的头
@@ -436,8 +491,7 @@ func (cc *ChunkCodec) writeBasicHeader(w io.Writer, format uint8, csID uint32) e
 		n = 3
 	}
 
-	_, err := w.Write(buf[:n])
-	return err
+	return writeFull(w, buf[:n])
 }
 
 // writeMessageHeader 写入消息头
@@ -453,11 +507,15 @@ func (cc *ChunkCodec) writeMessageHeader(w io.Writer, format uint8, csID uint32,
 		writeUint24(buf[3:6], msgLen)
 		buf[6] = msgType
 		binary.LittleEndian.PutUint32(buf[7:11], streamID)
-		_, err := w.Write(buf[:])
-		if err == nil && timestamp >= 0xFFFFFF {
-			err = binary.Write(w, binary.BigEndian, timestamp)
+		if err := writeFull(w, buf[:]); err != nil {
+			return err
 		}
-		return err
+		if timestamp >= 0xFFFFFF {
+			var ext [4]byte
+			binary.BigEndian.PutUint32(ext[:], timestamp)
+			return writeFull(w, ext[:])
+		}
+		return nil
 
 	case 1: // 7字节
 		var buf [7]byte
@@ -473,8 +531,7 @@ func (cc *ChunkCodec) writeMessageHeader(w io.Writer, format uint8, csID uint32,
 		}
 		writeUint24(buf[3:6], msgLen)
 		buf[6] = msgType
-		_, err := w.Write(buf[:])
-		return err
+		return writeFull(w, buf[:])
 
 	case 2: // 3字节
 		var buf [3]byte
@@ -488,8 +545,7 @@ func (cc *ChunkCodec) writeMessageHeader(w io.Writer, format uint8, csID uint32,
 		} else {
 			writeUint24(buf[0:3], tsDelta)
 		}
-		_, err := w.Write(buf[:])
-		return err
+		return writeFull(w, buf[:])
 
 	case 3: // 无头
 		return nil

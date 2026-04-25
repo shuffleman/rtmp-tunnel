@@ -77,6 +77,9 @@ type RTMPConn struct {
 	pendingCond      *sync.Cond
 	pendingBytes     int
 
+	writeBufPool     sync.Pool
+	videoPayloadPool sync.Pool
+
 	// 统计
 	bytesSent  atomic.Uint64
 	bytesRecv  atomic.Uint64
@@ -143,6 +146,12 @@ func newConn(cfg *config.Config, isServer bool) *RTMPConn {
 	}
 	c.pendingCond = sync.NewCond(&c.pendingMu)
 	c.reassem.SetLimits(cfg.MaxReassemblyPackets, cfg.MaxReassemblyBytes)
+	c.writeBufPool.New = func() any {
+		return make([]byte, 0, 32*1024)
+	}
+	c.videoPayloadPool.New = func() any {
+		return make([]byte, 0, 256*1024)
+	}
 	return c
 }
 
@@ -326,13 +335,13 @@ func (c *RTMPConn) Write(p []byte) (n int, err error) {
 	default:
 	}
 
-	// 复制数据(因为p可能被重用)
-	data := make([]byte, len(p))
+	data := c.getWriteBuf(len(p))
 	copy(data, p)
 
 	if deadline := c.writeDeadlineUnixNano.Load(); deadline > 0 {
 		now := time.Now().UnixNano()
 		if now >= deadline {
+			c.putWriteBuf(data)
 			return 0, timeoutError{}
 		}
 		timer := time.NewTimer(time.Until(time.Unix(0, deadline)))
@@ -341,8 +350,10 @@ func (c *RTMPConn) Write(p []byte) (n int, err error) {
 		case c.writeCh <- data:
 			return len(p), nil
 		case <-c.ctx.Done():
+			c.putWriteBuf(data)
 			return 0, fmt.Errorf("connection closed")
 		case <-timer.C:
+			c.putWriteBuf(data)
 			return 0, timeoutError{}
 		}
 	}
@@ -351,8 +362,49 @@ func (c *RTMPConn) Write(p []byte) (n int, err error) {
 	case c.writeCh <- data:
 		return len(p), nil
 	case <-c.ctx.Done():
+		c.putWriteBuf(data)
 		return 0, fmt.Errorf("connection closed")
 	}
+}
+
+func (c *RTMPConn) getWriteBuf(n int) []byte {
+	if n <= 0 {
+		return nil
+	}
+	if n > 64*1024 {
+		return make([]byte, n)
+	}
+	v := c.writeBufPool.Get()
+	if v == nil {
+		return make([]byte, n)
+	}
+	b := v.([]byte)
+	if cap(b) < n {
+		return make([]byte, n)
+	}
+	return b[:n]
+}
+
+func (c *RTMPConn) putWriteBuf(b []byte) {
+	if cap(b) == 0 || cap(b) > 64*1024 {
+		return
+	}
+	c.writeBufPool.Put(b[:0])
+}
+
+func (c *RTMPConn) getVideoPayloadBuf() []byte {
+	v := c.videoPayloadPool.Get()
+	if v == nil {
+		return nil
+	}
+	return v.([]byte)[:0]
+}
+
+func (c *RTMPConn) putVideoPayloadBuf(b []byte) {
+	if cap(b) == 0 || cap(b) > 2*1024*1024 {
+		return
+	}
+	c.videoPayloadPool.Put(b[:0])
 }
 
 // Close 实现io.Closer接口
