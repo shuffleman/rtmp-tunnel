@@ -147,10 +147,10 @@ func newConn(cfg *config.Config, isServer bool) *RTMPConn {
 	c.pendingCond = sync.NewCond(&c.pendingMu)
 	c.reassem.SetLimits(cfg.MaxReassemblyPackets, cfg.MaxReassemblyBytes)
 	c.writeBufPool.New = func() any {
-		return make([]byte, 0, 32*1024)
+		return make([]byte, 0, 64*1024)
 	}
 	c.videoPayloadPool.New = func() any {
-		return make([]byte, 0, 256*1024)
+		return make([]byte, 0, 4*1024)
 	}
 	return c
 }
@@ -380,6 +380,7 @@ func (c *RTMPConn) getWriteBuf(n int) []byte {
 	}
 	b := v.([]byte)
 	if cap(b) < n {
+		c.writeBufPool.Put(b[:0])
 		return make([]byte, n)
 	}
 	return b[:n]
