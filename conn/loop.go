@@ -322,6 +322,70 @@ func (c *RTMPConn) encryptAndSend(data []byte) {
 		return
 	}
 
+	maxFragLimit := c.cfg.MaxPendingProxyFragments
+	maxBytesLimit := c.cfg.MaxPendingProxyBytes
+	if maxFragLimit > 0 || maxBytesLimit > 0 {
+		estOverhead := 0
+		if c.cipher != nil {
+			estOverhead = 32
+		}
+		maxFragSize := c.frag.MaxFragSize()
+		if maxFragSize <= 0 {
+			maxFragSize = 1400
+		}
+		maxEncryptedLen := 0
+		if maxFragLimit > 0 {
+			maxEncryptedLen = maxFragLimit * maxFragSize
+		}
+		if maxBytesLimit > 0 {
+			bound := maxEncryptedLenForBytesLimit(maxBytesLimit, maxFragSize)
+			if maxEncryptedLen == 0 || bound < maxEncryptedLen {
+				maxEncryptedLen = bound
+			}
+		}
+		if maxEncryptedLen > 0 {
+			maxPlainLen := maxEncryptedLen - estOverhead
+			if maxPlainLen > 0 && len(data) > maxPlainLen {
+				for len(data) > 0 {
+					n := maxPlainLen
+					if n > len(data) {
+						n = len(data)
+					}
+					c.encryptAndSendChunk(data[:n], maxFragLimit, maxBytesLimit)
+					data = data[n:]
+				}
+				return
+			}
+		}
+	}
+	c.encryptAndSendChunk(data, maxFragLimit, maxBytesLimit)
+}
+
+func maxEncryptedLenForBytesLimit(maxBytes, maxFragSize int) int {
+	if maxBytes <= 0 || maxFragSize <= 0 {
+		return 0
+	}
+	lo, hi := 1, maxBytes
+	best := 0
+	for lo <= hi {
+		mid := (lo + hi) / 2
+		frags := (mid + maxFragSize - 1) / maxFragSize
+		total := mid + frags*crypto.FragmentHeaderSize
+		if total <= maxBytes {
+			best = mid
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+		}
+	}
+	return best
+}
+
+func (c *RTMPConn) encryptAndSendChunk(data []byte, maxFragLimit, maxBytesLimit int) {
+	if len(data) == 0 {
+		return
+	}
+
 	c.pendingMu.Lock()
 	estOverhead := 0
 	if c.cipher != nil {
@@ -337,8 +401,6 @@ func (c *RTMPConn) encryptAndSend(data []byte) {
 		estFrags = 1
 	}
 	estAddBytes := estEncryptedLen + estFrags*crypto.FragmentHeaderSize
-	maxFragLimit := c.cfg.MaxPendingProxyFragments
-	maxBytesLimit := c.cfg.MaxPendingProxyBytes
 	for c.ctx.Err() == nil {
 		if maxFragLimit > 0 && estFrags > maxFragLimit {
 			if len(c.pendingProxyData) == 0 {
@@ -420,7 +482,11 @@ func (c *RTMPConn) getPendingProxyDataBatch(max int) [][]byte {
 	if max > len(c.pendingProxyData) {
 		max = len(c.pendingProxyData)
 	}
-	data := c.pendingProxyData[:max]
+	data := make([][]byte, max)
+	copy(data, c.pendingProxyData[:max])
+	for i := 0; i < max; i++ {
+		c.pendingProxyData[i] = nil
+	}
 	c.pendingProxyData = c.pendingProxyData[max:]
 	removedBytes := 0
 	for _, d := range data {
