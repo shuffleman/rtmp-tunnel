@@ -22,6 +22,10 @@ func NewFragmenter(maxFragSize int) *Fragmenter {
 	return &Fragmenter{maxFragSize: maxFragSize}
 }
 
+func (f *Fragmenter) MaxFragSize() int {
+	return f.maxFragSize
+}
+
 // Fragment 将数据分片
 // 返回: [(header+payload), ...]
 func (f *Fragmenter) Fragment(seqNum uint32, data []byte) [][]byte {

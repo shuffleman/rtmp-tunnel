@@ -322,6 +322,54 @@ func (c *RTMPConn) encryptAndSend(data []byte) {
 		return
 	}
 
+	c.pendingMu.Lock()
+	estOverhead := 0
+	if c.cipher != nil {
+		estOverhead = 32
+	}
+	estEncryptedLen := len(data) + estOverhead
+	maxFragSize := c.frag.MaxFragSize()
+	if maxFragSize <= 0 {
+		maxFragSize = 1400
+	}
+	estFrags := (estEncryptedLen + maxFragSize - 1) / maxFragSize
+	if estFrags < 1 {
+		estFrags = 1
+	}
+	estAddBytes := estEncryptedLen + estFrags*crypto.FragmentHeaderSize
+	maxFragLimit := c.cfg.MaxPendingProxyFragments
+	maxBytesLimit := c.cfg.MaxPendingProxyBytes
+	for c.ctx.Err() == nil {
+		if maxFragLimit > 0 && estFrags > maxFragLimit {
+			if len(c.pendingProxyData) == 0 {
+				break
+			}
+			c.pendingCond.Wait()
+			continue
+		}
+		if maxBytesLimit > 0 && estAddBytes > maxBytesLimit {
+			if c.pendingBytes == 0 {
+				break
+			}
+			c.pendingCond.Wait()
+			continue
+		}
+		if maxFragLimit > 0 && len(c.pendingProxyData)+estFrags > maxFragLimit {
+			c.pendingCond.Wait()
+			continue
+		}
+		if maxBytesLimit > 0 && c.pendingBytes+estAddBytes > maxBytesLimit {
+			c.pendingCond.Wait()
+			continue
+		}
+		break
+	}
+	if c.ctx.Err() != nil {
+		c.pendingMu.Unlock()
+		return
+	}
+	c.pendingMu.Unlock()
+
 	// 加密
 	var encrypted []byte
 	if c.cipher != nil {
@@ -343,29 +391,6 @@ func (c *RTMPConn) encryptAndSend(data []byte) {
 	addBytes := 0
 	for _, frag := range frags {
 		addBytes += len(frag)
-	}
-	maxFragLimit := c.cfg.MaxPendingProxyFragments
-	if maxFragLimit > 0 && len(frags) > maxFragLimit {
-		maxFragLimit = 0
-	}
-	maxBytesLimit := c.cfg.MaxPendingProxyBytes
-	if maxBytesLimit > 0 && addBytes > maxBytesLimit {
-		maxBytesLimit = 0
-	}
-	for c.ctx.Err() == nil {
-		if maxFragLimit > 0 && len(c.pendingProxyData)+len(frags) > maxFragLimit {
-			c.pendingCond.Wait()
-			continue
-		}
-		if maxBytesLimit > 0 && c.pendingBytes+addBytes > maxBytesLimit {
-			c.pendingCond.Wait()
-			continue
-		}
-		break
-	}
-	if c.ctx.Err() != nil {
-		c.pendingMu.Unlock()
-		return
 	}
 	for _, frag := range frags {
 		c.pendingProxyData = append(c.pendingProxyData, frag)
