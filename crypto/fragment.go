@@ -175,7 +175,6 @@ func (r *Reassembler) AddFragment(frag []byte) ([]byte, error) {
 		for i := uint16(0); i < pp.totalFrags; i++ {
 			data, ok := pp.fragments[i]
 			if !ok {
-				r.mu.Unlock()
 				return nil, fmt.Errorf("missing fragment %d", i)
 			}
 			copy(out[off:], data)

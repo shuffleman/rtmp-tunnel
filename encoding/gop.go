@@ -136,10 +136,12 @@ func (gs *GOPSimulator) NextFrameMulti(proxyDataList [][]byte) (frameType uint8,
 			}
 		}
 
-		// 填充至目标大小
-		fillSize := targetSize - existingSize
-		if fillSize < 0 {
-			fillSize = 100 // 最小填充
+		fillSize := 128
+		if len(proxyDataList) == 0 {
+			fillSize = targetSize - existingSize
+			if fillSize < 0 {
+				fillSize = 100
+			}
 		}
 		idrPayload = gs.generateFillerData(fillSize)
 		idrNALU := gs.encoder.BuildIDRSlice(gs.mbCount, idrPayload)
@@ -165,10 +167,12 @@ func (gs *GOPSimulator) NextFrameMulti(proxyDataList [][]byte) (frameType uint8,
 		}
 	}
 
-	// 填充至目标大小
-	fillSize := targetSize - existingSize
-	if fillSize < 0 {
-		fillSize = 50
+	fillSize := 64
+	if len(proxyDataList) == 0 {
+		fillSize = targetSize - existingSize
+		if fillSize < 0 {
+			fillSize = 50
+		}
 	}
 	pPayload := gs.generateFillerData(fillSize)
 	pNALU := gs.encoder.BuildPFrameSlice(gs.mbCount, pPayload)

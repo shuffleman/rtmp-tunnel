@@ -71,11 +71,8 @@ type RTMPConn struct {
 	closeOnce sync.Once
 	closeErr  error
 
-	// 待嵌入视频帧的代理数据队列
-	pendingProxyData [][]byte
-	pendingMu        sync.Mutex
-	pendingCond      *sync.Cond
-	pendingBytes     int
+	scheduler  *proxyScheduler
+	schedNotify chan struct{}
 
 	writeBufPool     sync.Pool
 	videoPayloadPool sync.Pool
@@ -143,8 +140,8 @@ func newConn(cfg *config.Config, isServer bool) *RTMPConn {
 		tidGen:       command.NewTransactionID(),
 		recvNextSeq:  1,
 		recvPackets:  make(map[uint32][]byte),
+		schedNotify:  make(chan struct{}, 1),
 	}
-	c.pendingCond = sync.NewCond(&c.pendingMu)
 	c.reassem.SetLimits(cfg.MaxReassemblyPackets, cfg.MaxReassemblyBytes)
 	c.writeBufPool.New = func() any {
 		return make([]byte, 0, 64*1024)
@@ -152,6 +149,15 @@ func newConn(cfg *config.Config, isServer bool) *RTMPConn {
 	c.videoPayloadPool.New = func() any {
 		return make([]byte, 0, 4*1024)
 	}
+	c.scheduler = newProxyScheduler(cfg.MaxPendingProxyBytes, cfg.MaxPendingProxyFragments)
+	c.scheduler.setHooks(func() {
+		select {
+		case c.schedNotify <- struct{}{}:
+		default:
+		}
+	}, func(b []byte) {
+		c.putWriteBuf(b)
+	})
 	return c
 }
 
@@ -414,11 +420,9 @@ func (c *RTMPConn) Close() error {
 		c.state = StateClosing
 		c.closeErr = fmt.Errorf("connection closed")
 		c.cancel()
-		c.pendingMu.Lock()
-		if c.pendingCond != nil {
-			c.pendingCond.Broadcast()
+		if c.scheduler != nil {
+			c.scheduler.close()
 		}
-		c.pendingMu.Unlock()
 		if c.tcpConn != nil {
 			c.tcpConn.Close()
 		}

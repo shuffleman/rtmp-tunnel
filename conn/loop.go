@@ -61,27 +61,193 @@ func (c *RTMPConn) writeLoop() {
 	ticker := time.NewTicker(c.cfg.FlushInterval)
 	defer ticker.Stop()
 
-	var batch bytes.Buffer
-	batch.Grow(c.cfg.WriteBatchSize)
+	var (
+		parser     muxFrameParser
+		modeRaw    bool
+		detectDone bool
+		enableXray bool
+		reqNeed    int
+		holdSince  time.Time
+		rawBuf     bytes.Buffer
+	)
+	rawBuf.Grow(c.cfg.WriteBatchSize)
+
+	peekXray := func(buf []byte) (plausible bool, complete bool) {
+		if len(buf) < 2 {
+			return false, false
+		}
+		metaLen := int(binary.BigEndian.Uint16(buf[:2]))
+		if metaLen < 4 || metaLen > xrayMuxMaxMetadata {
+			return false, false
+		}
+		if len(buf) < 2+metaLen {
+			return true, false
+		}
+		meta := buf[2 : 2+metaLen]
+		status := meta[2]
+		option := meta[3]
+		if status != 0x01 && status != 0x02 && status != 0x03 && status != 0x04 {
+			return false, false
+		}
+		off := 4
+		if status == 0x01 {
+			if len(meta) < off+1+2 {
+				return false, false
+			}
+			network := meta[off]
+			if network != 0x01 && network != 0x02 {
+				return false, false
+			}
+		}
+		pos := 2 + metaLen
+		if option&0x01 != 0 {
+			if len(buf) < pos+2 {
+				return true, false
+			}
+			dlen := int(binary.BigEndian.Uint16(buf[pos : pos+2]))
+			pos += 2
+			if dlen < 0 || dlen > 65535 {
+				return false, false
+			}
+			if len(buf) < pos+dlen {
+				return true, false
+			}
+		}
+		return true, true
+	}
+
+	flushRaw := func() {
+		if rawBuf.Len() == 0 {
+			return
+		}
+		b := c.getWriteBuf(rawBuf.Len())
+		copy(b, rawBuf.Bytes())
+		rawBuf.Reset()
+		c.scheduler.enqueue(muxFrameMeta{}, b, true, c.seqMgr.NextSendSequence())
+	}
 
 	for {
 		select {
 		case <-c.ctx.Done():
+			flushRaw()
 			return
 
 		case data := <-c.writeCh:
-			if batch.Len()+len(data) > c.cfg.WriteBatchSize {
-				// 加密并分片
-				c.encryptAndSend(batch.Bytes())
-				batch.Reset()
+			if len(data) == 0 {
+				c.putWriteBuf(data)
+				continue
 			}
-			batch.Write(data)
 			c.putWriteBuf(data)
+			if modeRaw {
+				if len(data) < smallPacketThreshold {
+					b := c.getWriteBuf(len(data))
+					copy(b, data)
+					c.scheduler.enqueue(muxFrameMeta{}, b, true, c.seqMgr.NextSendSequence())
+					continue
+				}
+				if rawBuf.Len()+len(data) > c.cfg.WriteBatchSize {
+					flushRaw()
+				}
+				rawBuf.Write(data)
+				continue
+			}
+
+			parser.push(data)
+			if holdSince.IsZero() && len(parser.buf) > 0 {
+				holdSince = time.Now()
+			}
+			if !detectDone {
+				if plausible, complete := peekXray(parser.buf); plausible {
+					if complete {
+						detectDone = true
+						enableXray = true
+						holdSince = time.Time{}
+					}
+				} else {
+					if reqNeed == 0 && len(parser.buf) >= 2 {
+						ver := parser.buf[0]
+						proto := parser.buf[1]
+						if ver > 1 {
+							modeRaw = true
+						} else {
+							if proto < 1 || proto > 3 {
+								modeRaw = true
+							} else {
+								if ver == 0 {
+									reqNeed = 2
+									enableXray = proto == 3
+								} else {
+									if len(parser.buf) >= 3 {
+										paddingEnabled := parser.buf[2] != 0
+										if !paddingEnabled {
+											reqNeed = 3
+											enableXray = proto == 3
+										} else if len(parser.buf) >= 5 {
+											paddingLen := int(binary.BigEndian.Uint16(parser.buf[3:5]))
+											reqNeed = 5 + paddingLen
+											enableXray = proto == 3
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+				if modeRaw {
+					rawBuf.Write(parser.buf)
+					parser.buf = nil
+					holdSince = time.Time{}
+					continue
+				}
+				if reqNeed > 0 && len(parser.buf) >= reqNeed {
+					req := parser.buf[:reqNeed]
+					b := c.getWriteBuf(len(req))
+					copy(b, req)
+					c.scheduler.enqueue(muxFrameMeta{}, b, true, c.seqMgr.NextSendSequence())
+					parser.buf = parser.buf[reqNeed:]
+					reqNeed = 0
+					detectDone = true
+					holdSince = time.Time{}
+					if !enableXray && len(parser.buf) > 0 {
+						modeRaw = true
+						rawBuf.Write(parser.buf)
+						parser.buf = nil
+					}
+				}
+			}
+			if enableXray && detectDone && !modeRaw {
+				for {
+					meta, frame, ok, invalid := parser.nextXrayFrame()
+					if !ok {
+						if invalid {
+							modeRaw = true
+							rawBuf.Write(parser.buf)
+							parser.buf = nil
+							holdSince = time.Time{}
+						}
+						break
+					}
+					b := c.getWriteBuf(len(frame))
+					copy(b, frame)
+					c.scheduler.enqueue(meta, b, true, c.seqMgr.NextSendSequence())
+				}
+				if len(parser.buf) > 2+xrayMuxMaxMetadata+2+65535 {
+					modeRaw = true
+					rawBuf.Write(parser.buf)
+					parser.buf = nil
+					holdSince = time.Time{}
+				}
+			}
 
 		case <-ticker.C:
-			if batch.Len() > 0 {
-				c.encryptAndSend(batch.Bytes())
-				batch.Reset()
+			if modeRaw {
+				flushRaw()
+			} else if !detectDone && len(parser.buf) > 0 && !holdSince.IsZero() && time.Since(holdSince) >= 50*time.Millisecond {
+				modeRaw = true
+				rawBuf.Write(parser.buf)
+				parser.buf = nil
+				holdSince = time.Time{}
+				flushRaw()
 			}
 		}
 	}
@@ -124,6 +290,10 @@ func (c *RTMPConn) readLoop() {
 // frameGenerationLoop 帧生成循环：定期生成视频/音频帧维持伪装
 func (c *RTMPConn) frameGenerationLoop() {
 	frameInterval := time.Second / time.Duration(c.cfg.FrameRate)
+	minInterval := c.cfg.FlushInterval / 2
+	if minInterval < time.Millisecond {
+		minInterval = time.Millisecond
+	}
 	ticker := time.NewTicker(frameInterval)
 	defer ticker.Stop()
 
@@ -139,20 +309,20 @@ func (c *RTMPConn) frameGenerationLoop() {
 
 	frameCount := 0
 	lastIdleSend := time.Now()
+	lastSend := time.Time{}
 	for {
 		select {
 		case <-c.ctx.Done():
 			return
 		case <-ticker.C:
-			c.pendingMu.Lock()
-			hasPending := len(c.pendingProxyData) > 0
-			c.pendingMu.Unlock()
+			hasPending := c.scheduler.hasPending()
 			if !hasPending && time.Since(lastIdleSend) < time.Second {
 				continue
 			}
 			if !hasPending {
 				lastIdleSend = time.Now()
 			}
+			lastSend = time.Now()
 			frameCount++
 			// 每N帧发送一次音频标签
 			audioEvery := c.cfg.FrameRate / 2
@@ -171,6 +341,36 @@ func (c *RTMPConn) frameGenerationLoop() {
 				if err := c.sendAudioFrame(); err != nil {
 					c.fail(err)
 					return
+				}
+			}
+		case <-c.schedNotify:
+			if !c.scheduler.hasPending() {
+				continue
+			}
+			for i := 0; i < 4; i++ {
+				if !c.scheduler.hasPending() {
+					break
+				}
+				now := time.Now()
+				if !lastSend.IsZero() && now.Sub(lastSend) < minInterval {
+					break
+				}
+				lastSend = now
+				frameCount++
+				audioEvery := c.cfg.FrameRate / 2
+				if audioEvery < 1 {
+					audioEvery = 1
+				}
+				sendAudio := frameCount%audioEvery == 0
+				if err := c.sendVideoFrame(); err != nil {
+					c.fail(err)
+					return
+				}
+				if sendAudio {
+					if err := c.sendAudioFrame(); err != nil {
+						c.fail(err)
+						return
+					}
 				}
 			}
 		}
@@ -316,201 +516,21 @@ func (c *RTMPConn) handleAudioMessage(payload []byte) error {
 	return nil
 }
 
-// encryptAndSend 加密数据并分片发送
-func (c *RTMPConn) encryptAndSend(data []byte) {
-	if len(data) == 0 {
-		return
-	}
-
-	maxFragLimit := c.cfg.MaxPendingProxyFragments
-	maxBytesLimit := c.cfg.MaxPendingProxyBytes
-	if maxFragLimit > 0 || maxBytesLimit > 0 {
-		estOverhead := 0
-		if c.cipher != nil {
-			estOverhead = 32
-		}
-		maxFragSize := c.frag.MaxFragSize()
-		if maxFragSize <= 0 {
-			maxFragSize = 1400
-		}
-		maxEncryptedLen := 0
-		if maxFragLimit > 0 {
-			maxEncryptedLen = maxFragLimit * maxFragSize
-		}
-		if maxBytesLimit > 0 {
-			bound := maxEncryptedLenForBytesLimit(maxBytesLimit, maxFragSize)
-			if maxEncryptedLen == 0 || bound < maxEncryptedLen {
-				maxEncryptedLen = bound
-			}
-		}
-		if maxEncryptedLen > 0 {
-			maxPlainLen := maxEncryptedLen - estOverhead
-			if maxPlainLen > 0 && len(data) > maxPlainLen {
-				for len(data) > 0 {
-					n := maxPlainLen
-					if n > len(data) {
-						n = len(data)
-					}
-					c.encryptAndSendChunk(data[:n], maxFragLimit, maxBytesLimit)
-					data = data[n:]
-				}
-				return
-			}
-		}
-	}
-	c.encryptAndSendChunk(data, maxFragLimit, maxBytesLimit)
-}
-
-func maxEncryptedLenForBytesLimit(maxBytes, maxFragSize int) int {
-	if maxBytes <= 0 || maxFragSize <= 0 {
-		return 0
-	}
-	lo, hi := 1, maxBytes
-	best := 0
-	for lo <= hi {
-		mid := (lo + hi) / 2
-		frags := (mid + maxFragSize - 1) / maxFragSize
-		total := mid + frags*crypto.FragmentHeaderSize
-		if total <= maxBytes {
-			best = mid
-			lo = mid + 1
-		} else {
-			hi = mid - 1
-		}
-	}
-	return best
-}
-
-func (c *RTMPConn) encryptAndSendChunk(data []byte, maxFragLimit, maxBytesLimit int) {
-	if len(data) == 0 {
-		return
-	}
-
-	c.pendingMu.Lock()
-	estOverhead := 0
-	if c.cipher != nil {
-		estOverhead = 32
-	}
-	estEncryptedLen := len(data) + estOverhead
-	maxFragSize := c.frag.MaxFragSize()
-	if maxFragSize <= 0 {
-		maxFragSize = 1400
-	}
-	estFrags := (estEncryptedLen + maxFragSize - 1) / maxFragSize
-	if estFrags < 1 {
-		estFrags = 1
-	}
-	estAddBytes := estEncryptedLen + estFrags*crypto.FragmentHeaderSize
-	for c.ctx.Err() == nil {
-		if maxFragLimit > 0 && estFrags > maxFragLimit {
-			if len(c.pendingProxyData) == 0 {
-				break
-			}
-			c.pendingCond.Wait()
-			continue
-		}
-		if maxBytesLimit > 0 && estAddBytes > maxBytesLimit {
-			if c.pendingBytes == 0 {
-				break
-			}
-			c.pendingCond.Wait()
-			continue
-		}
-		if maxFragLimit > 0 && len(c.pendingProxyData)+estFrags > maxFragLimit {
-			c.pendingCond.Wait()
-			continue
-		}
-		if maxBytesLimit > 0 && c.pendingBytes+estAddBytes > maxBytesLimit {
-			c.pendingCond.Wait()
-			continue
-		}
-		break
-	}
-	if c.ctx.Err() != nil {
-		c.pendingMu.Unlock()
-		return
-	}
-	c.pendingMu.Unlock()
-
-	// 加密
-	var encrypted []byte
-	if c.cipher != nil {
-		var err error
-		encrypted, err = c.cipher.Encrypt(data)
-		if err != nil {
-			encrypted = data // 加密失败，发送明文
-		}
-	} else {
-		encrypted = data
-	}
-
-	// 分片
-	seqNum := c.seqMgr.NextSendSequence()
-	frags := c.frag.Fragment(seqNum, encrypted)
-
-	// 标记有代理数据等待嵌入
-	c.pendingMu.Lock()
-	addBytes := 0
-	for _, frag := range frags {
-		addBytes += len(frag)
-	}
-	for _, frag := range frags {
-		c.pendingProxyData = append(c.pendingProxyData, frag)
-	}
-	c.pendingBytes += addBytes
-	c.pendingMu.Unlock()
-}
-
-// getPendingProxyData 获取待嵌入视频帧的代理数据
-func (c *RTMPConn) getPendingProxyData() []byte {
-	list := c.getPendingProxyDataBatch(1)
-	if len(list) == 0 {
-		return nil
-	}
-	return list[0]
-}
-
-func (c *RTMPConn) getPendingProxyDataBatch(max int) [][]byte {
-	if max <= 0 {
-		return nil
-	}
-	c.pendingMu.Lock()
-	defer c.pendingMu.Unlock()
-	if len(c.pendingProxyData) == 0 {
-		return nil
-	}
-	if max > len(c.pendingProxyData) {
-		max = len(c.pendingProxyData)
-	}
-	data := make([][]byte, max)
-	copy(data, c.pendingProxyData[:max])
-	for i := 0; i < max; i++ {
-		c.pendingProxyData[i] = nil
-	}
-	c.pendingProxyData = c.pendingProxyData[max:]
-	removedBytes := 0
-	for _, d := range data {
-		removedBytes += len(d)
-	}
-	c.pendingBytes -= removedBytes
-	if c.pendingBytes < 0 {
-		c.pendingBytes = 0
-	}
-	if len(c.pendingProxyData) == 0 {
-		c.pendingProxyData = nil
-	}
-	c.pendingCond.Broadcast()
-	return data
-}
-
 // sendVideoFrame 发送单个视频帧
 func (c *RTMPConn) sendVideoFrame() error {
-	// 获取待发送的代理数据
 	maxPerFrame := c.cfg.MaxSEIPerFrame
 	if maxPerFrame <= 0 {
 		maxPerFrame = 1
 	}
-	proxyDataList := c.getPendingProxyDataBatch(maxPerFrame)
+	proxyDataList := make([][]byte, 0, maxPerFrame)
+	maxFragSize := c.frag.MaxFragSize()
+	for len(proxyDataList) < maxPerFrame {
+		frag, _, _, _ := c.scheduler.nextFragment(c, maxFragSize)
+		if len(frag) == 0 {
+			break
+		}
+		proxyDataList = append(proxyDataList, frag)
+	}
 
 	// 生成帧NAL单元
 	_, ts, nalus, err := c.gopSim.NextFrameMulti(proxyDataList)
