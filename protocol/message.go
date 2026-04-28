@@ -4,7 +4,6 @@ package protocol
 import (
 	"encoding/binary"
 	"fmt"
-	"io"
 	"time"
 )
 
@@ -26,6 +25,10 @@ type ControlMessages struct {
 	onChunkSizeChange func(int)
 }
 
+type ChunkWriter interface {
+	WriteRTMPMessage(csID uint32, msgType uint8, streamID uint32, timestamp uint32, payload []byte) error
+}
+
 // NewControlMessages 创建控制消息处理器
 func NewControlMessages(cc *ChunkCodec) *ControlMessages {
 	return &ControlMessages{
@@ -41,64 +44,64 @@ func (cm *ControlMessages) OnChunkSizeChange(cb func(int)) {
 }
 
 // SendSetChunkSize 发送设置块大小消息
-func (cm *ControlMessages) SendSetChunkSize(w io.Writer, size int) error {
+func (cm *ControlMessages) SendSetChunkSize(w ChunkWriter, size int) error {
 	if size < 1 || size > 0x7FFFFFFF {
 		return fmt.Errorf("invalid chunk size: %d", size)
 	}
 	payload := make([]byte, 4)
 	binary.BigEndian.PutUint32(payload, uint32(size))
-	return cm.chunkCodec.WriteChunk(w, 2, MsgTypeSetChunkSize, 0, 0, payload)
+	return w.WriteRTMPMessage(2, MsgTypeSetChunkSize, 0, 0, payload)
 }
 
 // SendWindowAckSize 发送窗口确认大小
-func (cm *ControlMessages) SendWindowAckSize(w io.Writer, size uint32) error {
+func (cm *ControlMessages) SendWindowAckSize(w ChunkWriter, size uint32) error {
 	payload := make([]byte, 4)
 	binary.BigEndian.PutUint32(payload, size)
-	return cm.chunkCodec.WriteChunk(w, 2, MsgTypeWindowAckSize, 0, 0, payload)
+	return w.WriteRTMPMessage(2, MsgTypeWindowAckSize, 0, 0, payload)
 }
 
 // SendSetPeerBandwidth 发送设置对等带宽
-func (cm *ControlMessages) SendSetPeerBandwidth(w io.Writer, bandwidth uint32, limitType uint8) error {
+func (cm *ControlMessages) SendSetPeerBandwidth(w ChunkWriter, bandwidth uint32, limitType uint8) error {
 	payload := make([]byte, 5)
 	binary.BigEndian.PutUint32(payload, bandwidth)
 	payload[4] = limitType
-	return cm.chunkCodec.WriteChunk(w, 2, MsgTypeSetPeerBandwidth, 0, 0, payload)
+	return w.WriteRTMPMessage(2, MsgTypeSetPeerBandwidth, 0, 0, payload)
 }
 
 // SendUserControl 发送用户控制消息
-func (cm *ControlMessages) SendUserControl(w io.Writer, eventType uint16, data []byte) error {
+func (cm *ControlMessages) SendUserControl(w ChunkWriter, eventType uint16, data []byte) error {
 	payload := make([]byte, 2+len(data))
 	binary.BigEndian.PutUint16(payload, eventType)
 	copy(payload[2:], data)
-	return cm.chunkCodec.WriteChunk(w, 2, MsgTypeUserControl, 0, 0, payload)
+	return w.WriteRTMPMessage(2, MsgTypeUserControl, 0, 0, payload)
 }
 
 // SendStreamBegin 发送流开始事件
-func (cm *ControlMessages) SendStreamBegin(w io.Writer, streamID uint32) error {
+func (cm *ControlMessages) SendStreamBegin(w ChunkWriter, streamID uint32) error {
 	data := make([]byte, 4)
 	binary.BigEndian.PutUint32(data, streamID)
 	return cm.SendUserControl(w, UserCtrlStreamBegin, data)
 }
 
 // SendPingRequest 发送Ping请求
-func (cm *ControlMessages) SendPingRequest(w io.Writer, timestamp uint32) error {
+func (cm *ControlMessages) SendPingRequest(w ChunkWriter, timestamp uint32) error {
 	data := make([]byte, 4)
 	binary.BigEndian.PutUint32(data, timestamp)
 	return cm.SendUserControl(w, UserCtrlPingRequest, data)
 }
 
 // SendPingResponse 发送Ping响应
-func (cm *ControlMessages) SendPingResponse(w io.Writer, timestamp uint32) error {
+func (cm *ControlMessages) SendPingResponse(w ChunkWriter, timestamp uint32) error {
 	data := make([]byte, 4)
 	binary.BigEndian.PutUint32(data, timestamp)
 	return cm.SendUserControl(w, UserCtrlPingResponse, data)
 }
 
 // SendAck 发送字节确认
-func (cm *ControlMessages) SendAck(w io.Writer, sequenceNumber uint32) error {
+func (cm *ControlMessages) SendAck(w ChunkWriter, sequenceNumber uint32) error {
 	payload := make([]byte, 4)
 	binary.BigEndian.PutUint32(payload, sequenceNumber)
-	return cm.chunkCodec.WriteChunk(w, 2, MsgTypeAck, 0, 0, payload)
+	return w.WriteRTMPMessage(2, MsgTypeAck, 0, 0, payload)
 }
 
 // HandleControlMessage 处理接收到的控制消息
@@ -113,6 +116,7 @@ func (cm *ControlMessages) HandleControlMessage(msg *Message) error {
 			return fmt.Errorf("invalid peer chunk size: %d", size)
 		}
 		cm.peerChunkSize = size
+		cm.chunkCodec.SetChunkSize(size)
 		if cm.onChunkSizeChange != nil {
 			cm.onChunkSizeChange(size)
 		}
@@ -174,7 +178,7 @@ func (cm *ControlMessages) handleUserControl(eventType uint16, data []byte) erro
 }
 
 // SendInitialControlMessages 发送初始控制消息(握手完成后)
-func (cm *ControlMessages) SendInitialControlMessages(w io.Writer, chunkSize int) error {
+func (cm *ControlMessages) SendInitialControlMessages(w ChunkWriter, chunkSize int) error {
 	// 设置较大的块大小
 	if err := cm.SendSetChunkSize(w, chunkSize); err != nil {
 		return fmt.Errorf("set chunk size: %w", err)
@@ -195,7 +199,7 @@ func (cm *ControlMessages) SendInitialControlMessages(w io.Writer, chunkSize int
 }
 
 // StartControlMessageLoop 启动控制消息维护循环(周期性ping/ack)
-func (cm *ControlMessages) StartControlMessageLoop(w io.Writer, done <-chan struct{}, onError func(error)) {
+func (cm *ControlMessages) StartControlMessageLoop(w ChunkWriter, done <-chan struct{}, onError func(error)) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 

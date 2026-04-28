@@ -15,18 +15,21 @@ import (
 	"github.com/shuffleman/rtmp-tunnel/container"
 	"github.com/shuffleman/rtmp-tunnel/crypto"
 	"github.com/shuffleman/rtmp-tunnel/encoding"
+	"github.com/shuffleman/rtmp-tunnel/metrics"
 	"github.com/shuffleman/rtmp-tunnel/protocol"
 )
+
+var globalConnID atomic.Uint64
 
 // RTMPConn RTMP伪装连接
 type RTMPConn struct {
 	cfg *config.Config
 
 	// 底层TCP连接
-	tcpConn    net.Conn
-	mu         sync.RWMutex
-	tcpWriteMu sync.Mutex
-	startTime  time.Time
+	tcpConn   net.Conn
+	mu        sync.RWMutex
+	startTime time.Time
+	connID    uint64
 
 	// RTMP协议组件
 	handshaker *protocol.Handshaker
@@ -71,11 +74,12 @@ type RTMPConn struct {
 	closeOnce sync.Once
 	closeErr  error
 
-	// 待嵌入视频帧的代理数据队列
-	pendingProxyData [][]byte
-	pendingMu        sync.Mutex
-	pendingCond      *sync.Cond
-	pendingBytes     int
+	scheduler   *proxyScheduler
+	schedNotify chan struct{}
+
+	outCtrlCh  chan *rtmpOutOp
+	outMediaCh chan *rtmpOutOp
+	outOnce    sync.Once
 
 	writeBufPool     sync.Pool
 	videoPayloadPool sync.Pool
@@ -131,9 +135,13 @@ func newConn(cfg *config.Config, isServer bool) *RTMPConn {
 		ctx:          ctx,
 		cancel:       cancel,
 		startTime:    time.Now(),
+		connID:       globalConnID.Add(1),
 		readCh:       make(chan []byte, 64),
-		writeCh:      make(chan []byte, 64),
+		writeCh:      make(chan []byte, 256),
 		errCh:        make(chan error, 1),
+		outCtrlCh:    make(chan *rtmpOutOp, 128),
+		outMediaCh:   make(chan *rtmpOutOp, 128),
+		schedNotify:  make(chan struct{}, 1),
 		cipher:       cipher,
 		frag:         crypto.NewFragmenter(cfg.MaxSEISize - 16 - 11), // 减去SEI开销和分片头
 		reassem:      crypto.NewReassembler(30 * time.Second),
@@ -144,7 +152,6 @@ func newConn(cfg *config.Config, isServer bool) *RTMPConn {
 		recvNextSeq:  1,
 		recvPackets:  make(map[uint32][]byte),
 	}
-	c.pendingCond = sync.NewCond(&c.pendingMu)
 	c.reassem.SetLimits(cfg.MaxReassemblyPackets, cfg.MaxReassemblyBytes)
 	c.writeBufPool.New = func() any {
 		return make([]byte, 0, 64*1024)
@@ -152,6 +159,29 @@ func newConn(cfg *config.Config, isServer bool) *RTMPConn {
 	c.videoPayloadPool.New = func() any {
 		return make([]byte, 0, 4*1024)
 	}
+	c.scheduler = newProxyScheduler(cfg)
+	connLabel := fmt.Sprintf("%d", c.connID)
+	c.scheduler.setHooks(func() {
+		select {
+		case c.schedNotify <- struct{}{}:
+		default:
+		}
+	}, func(b []byte) {
+		c.putWriteBuf(b)
+	}, func(p schedPriority) {
+		switch p {
+		case prioP0:
+			metrics.IncSchedulerDrop(connLabel, "p0")
+		case prioP1:
+			metrics.IncSchedulerDrop(connLabel, "p1")
+		default:
+			metrics.IncSchedulerDrop(connLabel, "p2")
+		}
+	}, func(backlog int) {
+		metrics.SetPerConnBacklogBytes(connLabel, backlog)
+	}, func(streamID uint16, items int) {
+		metrics.SetPerStreamBacklog(connLabel, fmt.Sprintf("%d", streamID), items)
+	})
 	return c
 }
 
@@ -165,7 +195,7 @@ func (c *RTMPConn) Dial(addr string) error {
 		tcpConn.Close()
 		return err
 	}
-	c.tcpConn = &writeLockedConn{Conn: tcpConn, mu: &c.tcpWriteMu, writeTimeout: c.cfg.NetworkWriteTimeout}
+	c.tcpConn = tcpConn
 	c.isServer = false
 
 	// 执行客户端握手
@@ -178,6 +208,11 @@ func (c *RTMPConn) Dial(addr string) error {
 	c.chunkCodec = protocol.NewChunkCodec()
 	c.chunkCodec.SetMaxMessageSize(c.cfg.MaxRTMPMessageSize)
 	c.ctrlMsgs = protocol.NewControlMessages(c.chunkCodec)
+	c.startOutLoop()
+	if err := c.ctrlMsgs.SendInitialControlMessages(c, c.cfg.MaxChunkSize); err != nil {
+		tcpConn.Close()
+		return fmt.Errorf("initial control: %w", err)
+	}
 
 	// 发送connect命令
 	if err := c.sendConnect(); err != nil {
@@ -202,7 +237,7 @@ func (c *RTMPConn) Accept(listener net.Listener) error {
 		tcpConn.Close()
 		return err
 	}
-	c.tcpConn = &writeLockedConn{Conn: tcpConn, mu: &c.tcpWriteMu, writeTimeout: c.cfg.NetworkWriteTimeout}
+	c.tcpConn = tcpConn
 	c.isServer = true
 
 	// 执行服务端握手
@@ -215,6 +250,11 @@ func (c *RTMPConn) Accept(listener net.Listener) error {
 	c.chunkCodec = protocol.NewChunkCodec()
 	c.chunkCodec.SetMaxMessageSize(c.cfg.MaxRTMPMessageSize)
 	c.ctrlMsgs = protocol.NewControlMessages(c.chunkCodec)
+	c.startOutLoop()
+	if err := c.ctrlMsgs.SendInitialControlMessages(c, c.cfg.MaxChunkSize); err != nil {
+		tcpConn.Close()
+		return fmt.Errorf("initial control: %w", err)
+	}
 
 	// 启动服务端处理循环
 	go c.serverLoop()
@@ -228,7 +268,7 @@ func (c *RTMPConn) Wrap(tcpConn net.Conn, isServer bool) error {
 	if err := c.configureTCP(tcpConn); err != nil {
 		return err
 	}
-	c.tcpConn = &writeLockedConn{Conn: tcpConn, mu: &c.tcpWriteMu, writeTimeout: c.cfg.NetworkWriteTimeout}
+	c.tcpConn = tcpConn
 	c.isServer = isServer
 	c.handshaker = protocol.NewHandshaker(isServer)
 
@@ -246,7 +286,8 @@ func (c *RTMPConn) Wrap(tcpConn net.Conn, isServer bool) error {
 	c.chunkCodec.SetMaxMessageSize(c.cfg.MaxRTMPMessageSize)
 	c.ctrlMsgs = protocol.NewControlMessages(c.chunkCodec)
 
-	if err := c.ctrlMsgs.SendInitialControlMessages(c.tcpConn, c.cfg.MaxChunkSize); err != nil {
+	c.startOutLoop()
+	if err := c.ctrlMsgs.SendInitialControlMessages(c, c.cfg.MaxChunkSize); err != nil {
 		return fmt.Errorf("initial control: %w", err)
 	}
 
@@ -414,11 +455,9 @@ func (c *RTMPConn) Close() error {
 		c.state = StateClosing
 		c.closeErr = fmt.Errorf("connection closed")
 		c.cancel()
-		c.pendingMu.Lock()
-		if c.pendingCond != nil {
-			c.pendingCond.Broadcast()
+		if c.scheduler != nil {
+			c.scheduler.close()
 		}
-		c.pendingMu.Unlock()
 		if c.tcpConn != nil {
 			c.tcpConn.Close()
 		}
@@ -581,7 +620,7 @@ func (c *RTMPConn) sendConnect() error {
 	if err != nil {
 		return err
 	}
-	return c.chunkCodec.WriteChunk(c.tcpConn, msg.ChunkStreamID, msg.Type, msg.StreamID, msg.Timestamp, msg.Payload)
+	return c.WriteRTMPMessage(msg.ChunkStreamID, msg.Type, msg.StreamID, msg.Timestamp, msg.Payload)
 }
 
 type timeoutError struct{}
@@ -589,19 +628,3 @@ type timeoutError struct{}
 func (timeoutError) Error() string   { return "i/o timeout" }
 func (timeoutError) Timeout() bool   { return true }
 func (timeoutError) Temporary() bool { return true }
-
-type writeLockedConn struct {
-	net.Conn
-	mu           *sync.Mutex
-	writeTimeout time.Duration
-}
-
-func (c *writeLockedConn) Write(p []byte) (int, error) {
-	c.mu.Lock()
-	if c.writeTimeout > 0 {
-		_ = c.Conn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
-	}
-	n, err := c.Conn.Write(p)
-	c.mu.Unlock()
-	return n, err
-}

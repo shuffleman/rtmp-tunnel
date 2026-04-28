@@ -42,6 +42,8 @@ type Config struct {
 	MaxFramePayloadSize int           `json:"maxFramePayloadSize" yaml:"maxFramePayloadSize"`
 	TimestampJitterMax  int           `json:"timestampJitterMax" yaml:"timestampJitterMax"` // 时间戳最大抖动(ms)
 	NetworkWriteTimeout time.Duration `json:"networkWriteTimeout" yaml:"networkWriteTimeout"`
+	SlowWriteThreshold  time.Duration `json:"slowWriteThreshold" yaml:"slowWriteThreshold"`
+	SchedulerDisable    bool          `json:"schedulerDisable" yaml:"schedulerDisable"`
 
 	// 内存保护/背压
 	MaxPendingProxyBytes     int `json:"maxPendingProxyBytes" yaml:"maxPendingProxyBytes"`
@@ -87,7 +89,8 @@ func DefaultConfig() *Config {
 		MaxSEIPerFrame:           4,
 		MaxFramePayloadSize:      4096,
 		TimestampJitterMax:       5, // ±5ms抖动
-		NetworkWriteTimeout:      10 * time.Second,
+		NetworkWriteTimeout:      60 * time.Second,
+		SlowWriteThreshold:       50 * time.Millisecond,
 		MaxPendingProxyBytes:     8 * 1024 * 1024,
 		MaxPendingProxyFragments: 8192,
 		MaxReassemblyPackets:     1024,
@@ -144,6 +147,9 @@ func (c *Config) Validate() error {
 	}
 	if c.NetworkWriteTimeout < 0 {
 		c.NetworkWriteTimeout = 0
+	}
+	if c.SlowWriteThreshold < 0 {
+		c.SlowWriteThreshold = 0
 	}
 	if c.MaxPendingProxyBytes < 0 {
 		c.MaxPendingProxyBytes = 0

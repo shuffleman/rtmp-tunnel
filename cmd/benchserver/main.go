@@ -12,12 +12,14 @@ import (
 
 	"github.com/shuffleman/rtmp-tunnel/config"
 	"github.com/shuffleman/rtmp-tunnel/conn"
+	"github.com/shuffleman/rtmp-tunnel/metrics"
 )
 
 func main() {
 	var (
 		listenAddr = flag.String("l", ":19000", "listen address")
 		mode       = flag.String("mode", "tcp", "tcp|rtmp")
+		metricsAddr = flag.String("metrics", "", "metrics listen address (e.g. :9100)")
 		appName    = flag.String("app", "live", "app name (rtmp)")
 		key        = flag.String("key", "", "encryption key (rtmp), supports base64:/hex: prefix")
 		bitrate    = flag.Int("bitrate", 5000000, "target bitrate (rtmp)")
@@ -29,6 +31,10 @@ func main() {
 		bufSize    = flag.Int("buf", 256*1024, "buffer size")
 	)
 	flag.Parse()
+	if *metricsAddr != "" {
+		metrics.Start(*metricsAddr)
+		log.Printf("metrics enabled: %s/metrics", *metricsAddr)
+	}
 
 	ln, err := net.Listen("tcp", *listenAddr)
 	if err != nil {
