@@ -77,6 +77,50 @@ func (c *RTMPConn) writeLoop() {
 	)
 	rawBuf.Grow(c.cfg.WriteBatchSize)
 
+	peekXray := func(buf []byte) (plausible bool, complete bool) {
+		if len(buf) < 2 {
+			return false, false
+		}
+		metaLen := int(binary.BigEndian.Uint16(buf[:2]))
+		if metaLen < 4 || metaLen > xrayMuxMaxMetadata {
+			return false, false
+		}
+		if len(buf) < 2+metaLen {
+			return true, false
+		}
+		meta := buf[2 : 2+metaLen]
+		status := meta[2]
+		option := meta[3]
+		if status != 0x01 && status != 0x02 {
+			return false, false
+		}
+		off := 4
+		if status == 0x01 {
+			if len(meta) < off+1+2 {
+				return false, false
+			}
+			network := meta[off]
+			if network != 0x01 && network != 0x02 {
+				return false, false
+			}
+		}
+		pos := 2 + metaLen
+		if option&0x01 != 0 {
+			if len(buf) < pos+2 {
+				return true, false
+			}
+			dlen := int(binary.BigEndian.Uint16(buf[pos : pos+2]))
+			pos += 2
+			if dlen < 0 || dlen > 65535 {
+				return false, false
+			}
+			if len(buf) < pos+dlen {
+				return true, false
+			}
+		}
+		return true, true
+	}
+
 	flushRaw := func() {
 		if rawBuf.Len() == 0 {
 			return
@@ -120,28 +164,36 @@ func (c *RTMPConn) writeLoop() {
 				holdSince = time.Now()
 			}
 			if !detectDone {
-				if reqNeed == 0 && len(parser.buf) >= 2 {
-					ver := parser.buf[0]
-					proto := parser.buf[1]
-					if ver > 1 {
-						modeRaw = true
-					} else {
-						if proto < 1 || proto > 3 {
+				if plausible, complete := peekXray(parser.buf); plausible {
+					if complete {
+						detectDone = true
+						enableXray = true
+						holdSince = time.Time{}
+					}
+				} else {
+					if reqNeed == 0 && len(parser.buf) >= 2 {
+						ver := parser.buf[0]
+						proto := parser.buf[1]
+						if ver > 1 {
 							modeRaw = true
 						} else {
-							if ver == 0 {
-								reqNeed = 2
-								enableXray = proto == 3
+							if proto < 1 || proto > 3 {
+								modeRaw = true
 							} else {
-								if len(parser.buf) >= 3 {
-									paddingEnabled := parser.buf[2] != 0
-									if !paddingEnabled {
-										reqNeed = 3
-										enableXray = proto == 3
-									} else if len(parser.buf) >= 5 {
-										paddingLen := int(binary.BigEndian.Uint16(parser.buf[3:5]))
-										reqNeed = 5 + paddingLen
-										enableXray = proto == 3
+								if ver == 0 {
+									reqNeed = 2
+									enableXray = proto == 3
+								} else {
+									if len(parser.buf) >= 3 {
+										paddingEnabled := parser.buf[2] != 0
+										if !paddingEnabled {
+											reqNeed = 3
+											enableXray = proto == 3
+										} else if len(parser.buf) >= 5 {
+											paddingLen := int(binary.BigEndian.Uint16(parser.buf[3:5]))
+											reqNeed = 5 + paddingLen
+											enableXray = proto == 3
+										}
 									}
 								}
 							}
